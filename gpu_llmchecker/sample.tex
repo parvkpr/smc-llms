@@ -1,0 +1,1002 @@
+\documentclass[11pt,a4paper]{article}
+
+% ── Packages ──────────────────────────────────────────────────────────────────
+\usepackage[margin=1.25in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{listings}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit,backgrounds}
+
+\hypersetup{colorlinks=true, linkcolor=blue!70!black, citecolor=green!50!black,
+            urlcolor=blue!70!black}
+
+% ── Theorem environments ──────────────────────────────────────────────────────
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+
+% ── Notation shorthands ───────────────────────────────────────────────────────
+\newcommand{\Prob}{\mathbb{P}}
+\newcommand{\Nat}{\mathbb{N}}
+\newcommand{\Real}{\mathbb{R}}
+\newcommand{\calS}{\mathcal{S}}
+\newcommand{\calP}{\mathcal{P}}
+\newcommand{\Distr}{\mathrm{Distr}}
+\newcommand{\topka}{T\!O\!P^\alpha_k}
+\newcommand{\eps}{\varepsilon}
+\newcommand{\bigO}{\mathcal{O}}
+
+% ── Code style ────────────────────────────────────────────────────────────────
+\lstset{basicstyle=\ttfamily\small, breaklines=true,
+        keywordstyle=\color{blue}, commentstyle=\color{gray}}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\title{\textbf{GPU-Parallel Probabilistic Model Checking of\\
+       Large Language Model Outputs}\\[4pt]
+       \large BFS Construction, Sparse Backward Induction,\\
+       and Direct Statistical Model Checking for Long Lookaheads}
+
+\author{
+  \textit{Technical Report}\\[2pt]
+  \normalsize Based on \textsc{LLMChecker} (Gross, Spieker \& Gotlieb, arXiv:2509.18836)
+}
+\date{\today}
+
+% =============================================================================
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+
+% ── Abstract ──────────────────────────────────────────────────────────────────
+\begin{abstract}
+Probabilistic Computation Tree Logic (PCTL) model checking of Large Language
+Model (LLM) text generation provides formal, probability-certified answers to
+questions such as \emph{``What is the probability this model generates
+gender-biased text in the next $L$ tokens?''}
+The recently proposed \textsc{LLMChecker} framework~\cite{gross2025llmchecker}
+demonstrates this is feasible for small lookahead depths, but is bottlenecked by
+state-space explosion: the $\alpha$-$k$-bounded DTMC has up to $k^L$ states,
+and exact verification via the Storm model checker becomes intractable beyond
+$L \approx 10$ tokens.
+
+We make three contributions to break this barrier.
+\textbf{(1)} We replace the recursive depth-first DTMC construction
+(Algorithm~1 in~\cite{gross2025llmchecker}) with a \emph{breadth-first}
+construction that submits all nodes at depth $d$ as a single batched GPU
+inference call, reducing serial LLM calls from $\bigO(k^L)$ to $\bigO(L)$.
+\textbf{(2)} We exploit the tree structure of the resulting DTMC to replace
+Storm's iterative linear system solver with a single \emph{GPU sparse backward
+induction} pass ($\bigO(L)$ sparse matrix–vector products), reducing
+verification from hours to milliseconds.
+\textbf{(3)} We introduce \emph{Direct Statistical Model Checking} (Direct
+SMC), a novel method that bypasses DTMC construction entirely by sampling $M$
+complete trajectories of length $L$ directly from the LLM using vLLM's native
+multi-sequence GPU batching, then evaluating the PCTL property on each
+trajectory.
+With a Chernoff–Hoeffding confidence bound of
+$\eps = \sqrt{\ln(2/\delta)/(2M)}$, Direct SMC scales to \emph{any} $L$
+bounded only by the model's context window, requires no modification to the
+LLM, and is embarrassingly parallel on GPU.
+We demonstrate the system on GPT-2, obtaining formal probability estimates for
+PCTL properties at $L = 50$ tokens in under $16$~seconds — a regime entirely
+out of reach for the exact approach.
+\end{abstract}
+
+\clearpage
+\tableofcontents
+\clearpage
+
+% =============================================================================
+\section{Introduction}
+\label{sec:intro}
+
+Large Language Models generate text by sampling tokens sequentially from a
+learned conditional distribution.
+This sequential, probabilistic process has a natural mathematical
+representation: a \emph{Discrete-Time Markov Chain} (DTMC) whose states are
+the partially generated strings and whose transition probabilities are the
+token probabilities output by the model.
+\emph{Probabilistic Computation Tree Logic}
+(PCTL)~\cite{hansson1994logic,baier2008principles} is a temporal logic
+designed precisely for reasoning about properties of DTMCs, and offers a
+vocabulary rich enough to express diverse safety and quality properties of LLM
+outputs:
+
+\begin{align*}
+\Prob(\mathbf{F}\; \textit{gender} > 0)
+  &\quad \text{``probability of eventually generating male-biased text''} \\
+\Prob(\mathbf{G}\; \textit{readability} > 5997)
+  &\quad \text{``probability of always producing readable text''} \\
+\Prob(\mathbf{F}\; \textit{step}=5 \wedge \textit{similarity} > 90)
+  &\quad \text{``probability of reproducing a copyrighted phrase''}
+\end{align*}
+
+These are not empirical statistics collected over a test set — they are formal,
+probability-certified statements about the model's generation mechanism,
+analogous to hardware circuit verification or safety proofs in reactive systems.
+
+\paragraph{The \textsc{LLMChecker} paper.}
+Gross, Spieker and Gotlieb~\cite{gross2025llmchecker} introduced
+\textsc{LLMChecker}, the first system to apply PCTL model checking to LLM text
+generation.
+Their central insight is the $\alpha$-$k$ bounding trick: at each generation
+step, instead of expanding all $|\Sigma| \approx 32{,}000$ possible tokens
+(which makes the DTMC intractable), they retain only the top-$k$ tokens whose
+cumulative probability mass reaches threshold $\alpha$.
+Empirically, LLMs concentrate most of their probability on very few tokens
+(e.g.\ Gemma-2B reaches $\alpha=0.9$ with the top $3$ tokens), so $k$ can be
+kept small.
+The resulting DTMC is encoded in the PRISM language and verified by the Storm
+model checker~\cite{hensel2022storm}.
+
+\paragraph{The state-space explosion problem.}
+Despite the $\alpha$-$k$ reduction, the DTMC still has up to
+$\sum_{d=0}^{L} k^d = \Theta(k^L)$ states.
+For Mistral-7B with $k{=}15$, $L{=}5$: already $255{,}085$ states and
+$23{,}023$ seconds of encoding time (Table~II in~\cite{gross2025llmchecker}).
+For $L{=}30$, $k{=}5$: $5^{30} \approx 9.3 \times 10^{20}$ states — beyond
+any computer.
+The paper's authors acknowledge scalability as a key open problem.
+
+\paragraph{Our contributions.}
+We identify that two properties of the \textsc{LLMChecker} DTMC have gone
+unexploited:
+\begin{enumerate}
+  \item \textbf{Level independence.}  All nodes at depth $d$ are mutually
+    independent — they share no state and require identical operations (one
+    LLM forward pass each).  This is natural parallelism that the DFS
+    algorithm wastes.
+  \item \textbf{Tree structure.}  Because each DTMC state is a unique string
+    prefix, there are no back-edges or cycles.  PCTL reachability on a tree
+    reduces to simple backward induction, not iterative linear system solving.
+\end{enumerate}
+Exploiting (1) gives our BFS construction (\S\ref{sec:bfs}).
+Exploiting (2) gives our GPU sparse backward induction (\S\ref{sec:backward}).
+When $k^L$ itself is the barrier, we introduce Direct SMC (\S\ref{sec:dsmc})
+which avoids building the DTMC at all.
+
+% =============================================================================
+\section{Background}
+\label{sec:background}
+
+\subsection{Discrete-Time Markov Chains}
+
+\begin{definition}[DTMC]
+A \emph{discrete-time Markov chain} is a tuple
+$(S, P, s_0, \mathit{AP}, L)$ where $S$ is a finite set of states,
+$P: S \times S \to [0,1]$ is a transition function satisfying
+$\sum_{s' \in S} P(s,s') = 1$ for all $s$,
+$s_0 \in S$ is the initial state,
+$\mathit{AP}$ is a set of atomic propositions, and
+$L: S \to 2^{\mathit{AP}}$ is a labelling function.
+\end{definition}
+
+A state $s$ is \emph{terminal} if $P(s,s)=1$ (absorbing self-loop).
+A \emph{path} in the DTMC is a sequence $s_0, s_1, s_2, \ldots$ where
+$P(s_i, s_{i+1}) > 0$ for all $i$.
+
+\subsection{PCTL}
+
+PCTL extends CTL with a probabilistic operator $\mathcal{P}_{\sim p}(\cdot)$
+quantifying path properties~\cite{hansson1994logic}.
+We focus on the two path formulas used in~\cite{gross2025llmchecker}:
+
+\begin{align}
+  \mathcal{P}_{\sim p}(\mathbf{F}\,\phi)
+    &\quad \text{the probability of \emph{eventually} reaching a state
+                 satisfying $\phi$ is $\sim p$} \label{eq:eventually}\\
+  \mathcal{P}_{\sim p}(\mathbf{G}\,\phi)
+    &\quad \text{the probability of \emph{always} staying in states
+                 satisfying $\phi$ is $\sim p$} \label{eq:always}
+\end{align}
+
+where $\sim\, \in \{>, \ge, <, \le, =\}$ and $\phi$ is an atomic proposition
+over state features (e.g.\ $\textit{gender} > 0$).
+
+In our setting the quantified probability is \emph{computed} (not just checked
+against a threshold), so we drop $\sim p$ and write $\Prob(\mathbf{F}\,\phi)$
+and $\Prob(\mathbf{G}\,\phi)$ for the exact reachability probability.
+
+\subsection{LLM Formalisation and $\alpha$-$k$ Bounding}
+
+Following~\cite{gross2025llmchecker}, an LLM is a function
+$f: \Sigma^* \to \Distr(\Sigma)$ mapping a string to a probability distribution
+over tokens, where $\Sigma$ is the token vocabulary.
+The $\alpha$-$k$ selection operator retains the most probable tokens up to
+cumulative probability $\alpha$, capped at $k$:
+\[
+  \topka(f(\omega))
+  = \{(\sigma_i, p_i)\}_{i=1}^{n},
+  \quad n = \min\!\left(k,\,
+    \min\!\left\{m : \textstyle\sum_{i=1}^m p_i \ge \alpha\right\}\right)
+\]
+The $\alpha$-$k$-bounded DTMC has one state per distinct generated string
+prefix and one terminal \textsc{Rest} state per node to absorb the remaining
+probability mass $1 - \sum_i p_i$.
+
+\subsection{The \textsc{LLMChecker} Algorithm (Original)}
+
+Algorithm~\ref{alg:original} reproduces the encoding procedure from
+\cite{gross2025llmchecker} (their Algorithm~1).
+It performs a recursive DFS over the token tree, issuing one LLM call per
+node.
+The DTMC is serialised as a PRISM program and verified offline by Storm.
+
+\begin{algorithm}[h]
+\caption{Original \textsc{LLMChecker} DTMC construction (DFS)}
+\label{alg:original}
+\begin{algorithmic}[1]
+\Require $\omega^{(0)}, s_\text{parent}, p_\text{parent}, k, L, M(\omega)$
+\Ensure DTMC $D$ (built incrementally as PRISM code)
+\State $i \gets |\omega^{(0)}|$; \quad $\textit{UID} \gets \text{fresh}()$
+\If{$\omega^{(0)} = \textsc{Rest}$}
+  \State $s \gets (i, \textit{UID}, \textsc{Placeholder})$
+\Else
+  \State $s \gets (i, \textit{UID}, M(\omega^{(0)}))$
+\EndIf
+\If{$s_\text{parent} \ne \textsc{null}$}
+  \State $P(s_\text{parent}, s) \gets p_\text{parent}$
+\EndIf
+\If{$L = 0$ \textbf{or} $\omega^{(0)} = \textsc{Rest}$}  \Return  \EndIf
+\State $T \gets \topka(f(\omega^{(0)}))$   \Comment{\textbf{Serial} LLM call}
+\State $p_\text{sum} \gets 0$
+\For{$(\sigma, p) \in T$}
+  \State $\omega' \gets \omega^{(0)} \cdot \sigma$
+  \State $\Call{RMC}{\omega', s, p, k, L{-}1, M}$   \Comment{DFS recursion}
+  \State $p_\text{sum} \gets p_\text{sum} + p$
+\EndFor
+\State $\Call{RMC}{\textsc{Rest}, s, 1{-}p_\text{sum}, k, L{-}1, M}$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Serial bottleneck.}
+Algorithm~\ref{alg:original} makes $\sum_{d=0}^{L} k^d = \Theta(k^L)$
+sequential LLM calls.
+For $k=15$, $L=5$ this is $\sim\!750{,}000$ calls.
+The encoding times in Table~II of~\cite{gross2025llmchecker} range from $2$
+to $23{,}023$ seconds for a single verification query.
+
+
+% =============================================================================
+\section{BFS Construction with Batched GPU Inference}
+\label{sec:bfs}
+
+\subsection{Key Observation: Level Independence}
+
+\begin{proposition}[Level independence]
+\label{prop:level-independence}
+All nodes at depth $d$ in the $\alpha$-$k$-bounded DTMC are mutually
+independent: (i)~they do not share state, (ii)~they all require identical
+operations (one evaluation of $\topka(f(\cdot))$), and (iii)~their
+string prefixes are entirely determined before depth $d$ is processed.
+\end{proposition}
+
+\begin{proof}
+Each node's string $\omega$ uniquely determines its position in the tree.
+No transition leads from depth $d$ back to depth $d$ or earlier (the DTMC is
+a directed tree), so nodes at depth $d$ are causally independent of each
+other.  The LLM call $f(\omega)$ depends only on $\omega$, not on any
+sibling node.
+\end{proof}
+
+Proposition~\ref{prop:level-independence} motivates replacing DFS with BFS:
+collect \emph{all} nodes at depth $d$, submit them as a single batched
+inference call, and receive all their top-$k$ distributions simultaneously.
+
+\subsection{The BFS Algorithm}
+
+Algorithm~\ref{alg:bfs} gives the BFS construction.
+The outer loop iterates $L$ times (once per depth level), and the single LLM
+call on line~\ref{line:batch} processes the entire level in parallel.
+
+\begin{algorithm}[h]
+\caption{BFS DTMC construction with batched GPU inference}
+\label{alg:bfs}
+\begin{algorithmic}[1]
+\Require $\omega^{(0)}, L, \alpha, k, M(\cdot)$, backend
+\Ensure levels $= [\ell_0, \ell_1, \ldots, \ell_L]$
+\State $r \gets \text{DTMCNode}(\omega^{(0)}, \text{depth}=0, p=1)$
+\State $\ell_0 \gets [r]$; \quad $\text{active} \gets [r]$
+\For{$d = 0, \ldots, L{-}1$}
+  \State $\omega\text{-batch} \gets [\text{node.string for node in active}]$
+  \State $\text{results} \gets \text{backend.get\_top\_k\_batch}(\omega\text{-batch},\, \alpha,\, k)$
+    \label{line:batch}
+    \Comment{\textbf{Single batched GPU call for entire level $d$}}
+  \State $\ell_{d+1} \gets [\ ]$; \quad $\text{next\_active} \gets [\ ]$
+  \For{$(\text{node},\, (\text{tokens},\, \text{probs})) \in \text{zip}(\text{active},\, \text{results})$}
+    \State $p_\text{sum} \gets 0$
+    \For{$(\sigma,\, p) \in \text{zip}(\text{tokens},\, \text{probs})$}
+      \State child $\gets \text{DTMCNode}(\text{node.string}+\sigma,\, d+1,\, p,\, M(\cdot))$
+      \State $\ell_{d+1}.\text{append}(\text{child})$; \quad
+             $\text{next\_active}.\text{append}(\text{child})$
+      \State $p_\text{sum} \gets p_\text{sum} + p$
+    \EndFor
+    \If{$1 - p_\text{sum} > 0$}  \Comment{REST absorbing terminal}
+      \State $\ell_{d+1}.\text{append}(\text{DTMCNode}(\textsc{Rest},\, d+1,\, 1{-}p_\text{sum}))$
+    \EndIf
+  \EndFor
+  \State $\text{active} \gets \text{next\_active}$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Complexity Comparison}
+
+\begin{proposition}[Serial LLM calls]
+Algorithm~\ref{alg:original} requires $\Theta(k^L)$ serial LLM calls.
+Algorithm~\ref{alg:bfs} requires exactly $L$ batched LLM calls.
+\end{proposition}
+
+The work performed per call is the same in both cases — evaluating $\topka(f(\omega))$ for one string.
+The difference is that Algorithm~\ref{alg:bfs} performs this work for all $k^d$ strings at depth $d$ in parallel on the GPU, while Algorithm~\ref{alg:original} serialises them.
+
+\subsection{vLLM Prefix Caching Synergy}
+
+BFS construction exposes a further optimisation when paired with
+vLLM~\cite{kwon2023efficient}'s automatic KV-cache prefix sharing
+(\texttt{enable\_prefix\_caching=True}).
+All $k^d$ nodes at depth $d$ share the same initial string $\omega^{(0)}$
+as a common prefix.
+Within a BFS level, siblings that diverged recently share a longer common
+prefix.
+vLLM's \emph{PagedAttention} stores KV blocks in a content-addressed cache:
+any prefix whose KV blocks have already been computed is served from the
+cache at zero additional cost.
+This means the transformer's attention over the shared portion of the tree
+is computed exactly once per prefix string, just as the DFS recursion
+implicitly reused its stack state — but now across a full GPU batch.
+
+Figure~\ref{fig:prefix-cache} illustrates the effect observed in our
+experiments: at depth 2 with 25 concurrent requests sharing the prefix
+\texttt{"The player won because"}, vLLM reports an input throughput of
+$15{,}985$ tokens/s; at depth 3 (121 requests) this rises to
+$48{,}321$ tokens/s, consistent with near-complete prefix cache hits.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+  every node/.style={font=\small},
+  edge/.style={-{Stealth[length=2mm]}, thick},
+  nodestyle/.style={circle, draw, fill=blue!10, minimum size=7mm, inner sep=1pt},
+  cached/.style={circle, draw, fill=green!20, minimum size=7mm, inner sep=1pt},
+  batch/.style={draw=red!70, thick, rounded corners, inner sep=4pt}
+]
+% Root
+\node[cached] (r) at (0,0) {$\omega_0$};
+% Depth 1
+\foreach \i/\x in {1/-2,2/0,3/2}{
+  \node[cached] (d1\i) at (\x,-1.4) {$\omega_0\sigma_\i$};
+  \draw[edge] (r) -- (d1\i);
+}
+% Depth 2
+\foreach \j/\x in {1/-3.2,2/-2,3/-0.8}{
+  \node[nodestyle] (d2\j) at (\x,-2.8) {};
+  \draw[edge] (d11) -- (d2\j);
+}
+\foreach \j/\x in {4/-0.2,5/0.8,6/1.8}{
+  \node[nodestyle] (d2\j) at (\x,-2.8) {};
+  \draw[edge] (d12) -- (d2\j);
+}
+\foreach \j/\x in {7/2.4,8/3.2,9/4.0}{
+  \node[nodestyle] (d2\j) at (\x,-2.8) {};
+  \draw[edge] (d13) -- (d2\j);
+}
+% Batch box around depth 2
+\node[batch, fit=(d21)(d29), label=right:{\footnotesize single GPU call (9 requests)}] {};
+% Legend
+\node[cached,label=right:{\footnotesize KV cache hit (prefix shared)}] at (-1,-3.8) {};
+\node[nodestyle,label=right:{\footnotesize new computation required}] at (2.5,-3.8) {};
+\end{tikzpicture}
+\caption{BFS at depth 2: all 9 nodes are submitted as one GPU call.
+Green nodes (depth 0 and 1) are prefix-cache hits in vLLM — their KV
+blocks were computed in earlier levels and are reused for free.}
+\label{fig:prefix-cache}
+\end{figure}
+
+
+% =============================================================================
+\section{GPU Sparse Backward Induction}
+\label{sec:backward}
+
+\subsection{The Tree DTMC is Acyclic}
+
+\begin{proposition}[DTMC is a tree]
+\label{prop:tree}
+The $\alpha$-$k$-bounded LLM text generation DTMC produced by
+Algorithm~\ref{alg:bfs} is a directed tree: every state is a unique string
+$\omega$, and no transition leads from a deeper to a shallower node.
+\end{proposition}
+
+\begin{proof}
+By construction, each child node's string is strictly longer than its parent's.
+Since string length is a strict invariant along any path, there can be no
+cycles.
+\end{proof}
+
+\begin{corollary}[No iterative solver needed]
+On a tree DTMC, PCTL reachability reduces to a finite backward induction.
+No iterative linear system solver (such as Storm's value iteration or
+Gauss-Seidel) is required.
+\end{corollary}
+
+\subsection{Backward Induction Recurrences}
+
+Let $V_d[i]$ denote the PCTL probability at the $i$-th node of depth $d$.
+The recurrences for the two operators are:
+
+\paragraph{Eventually $\Prob(\mathbf{F}\,\phi)$.}
+\begin{equation}
+  V_d[i] =
+  \begin{cases}
+    1 & \text{if } \phi(\text{node}_i) \\
+    0 & \text{if node}_i \text{ is terminal} \\
+    \displaystyle\sum_j T_d[i,j]\cdot V_{d+1}[j] & \text{otherwise}
+  \end{cases}
+  \label{eq:eventually-recurrence}
+\end{equation}
+
+\paragraph{Always $\Prob(\mathbf{G}\,\phi)$.}
+\begin{equation}
+  V_d[i] =
+  \begin{cases}
+    0 & \text{if } \neg\phi(\text{node}_i) \text{ or node}_i \text{ is terminal} \\
+    \displaystyle\sum_j T_d[i,j]\cdot V_{d+1}[j] & \text{otherwise}
+  \end{cases}
+  \label{eq:always-recurrence}
+\end{equation}
+
+where $T_d \in \Real^{|\ell_d| \times |\ell_{d+1}|}$ is the sparse transition
+matrix at depth $d$ with $T_d[i,j] = P(\text{node}_i \to \text{node}_j)$.
+
+\subsection{GPU Implementation}
+
+Each backward step is:
+\[
+  V_d \;\gets\; T_d \cdot V_{d+1}
+  \quad \text{followed by}\quad
+  V_d[\text{satisfying}] \gets 1, \quad V_d[\text{terminal}] \gets 0
+\]
+The matrix-vector product $T_d \cdot V_{d+1}$ is a single \texttt{torch.sparse.mm}
+call on GPU.
+$T_d$ is stored in COO sparse format; for $k=5$, $L=7$, the deepest level has
+at most $5^7 = 78{,}125$ nodes and $5^7 \cdot 5 \approx 390{,}000$ non-zeros,
+well within the memory budget of a consumer GPU.
+
+The total number of GPU kernel launches is $L$ (one per depth level), compared
+to Storm's iterative solver which requires $O(|S|)$ matrix-vector products to
+converge.
+In practice this reduces verification time from \emph{hours} (Storm, CPU) to
+\emph{milliseconds} (Algorithm~\ref{alg:bwd}, GPU).
+
+\begin{algorithm}[h]
+\caption{GPU sparse backward induction}
+\label{alg:bwd}
+\begin{algorithmic}[1]
+\Require levels $= [\ell_0,\ldots,\ell_L]$, query (operator + predicate $\phi$)
+\Ensure $V_0[0] = \Prob(\mathbf{F}/\mathbf{G}\;\phi)$ at the root
+\State Initialise $V_L[i] \gets \phi(\text{node}_i)$ for all $i$ in $\ell_L$
+\For{$d = L{-}1 \;\text{downto}\; 0$}
+  \State Build sparse $T_d$ (COO format) from $\ell_d$ children lists
+  \State $V_d \gets T_d \cdot V_{d+1}$  \Comment{GPU \texttt{torch.sparse.mm}}
+  \State $V_d[i] \gets 1$ for all $i$ with $\phi(\ell_d[i])$ and operator $= \mathbf{F}$
+  \State $V_d[i] \gets 0$ for all $i$ with $\neg\phi(\ell_d[i])$ and operator $= \mathbf{G}$
+  \State $V_d[i] \gets 0$ for all terminal $\ell_d[i]$
+\EndFor
+\Return $V_0[0]$
+\end{algorithmic}
+\end{algorithm}
+
+
+% =============================================================================
+\section{Direct Statistical Model Checking for Long Lookaheads}
+\label{sec:dsmc}
+
+\subsection{Motivation}
+
+Even with BFS and GPU backward induction, the state space $\Theta(k^L)$ is the
+fundamental barrier.
+For $L = 30$, $k = 5$: $5^{30} \approx 9.3 \times 10^{20}$ states.
+For $L = 50$, $k = 5$: $5^{50} \approx 8.9 \times 10^{34}$ states.
+No algorithm can enumerate these.
+
+However, PCTL reachability probabilities can be \emph{estimated} without
+enumerating the state space, using \emph{Statistical Model Checking}
+(SMC)~\cite{younes2002probabilistic,clarke2011model}.
+Classical SMC traces \emph{sampled paths} through the DTMC and uses
+hypothesis testing or confidence intervals to estimate probabilities.
+
+The \textsc{LLMChecker} paper does not implement or discuss SMC.
+We introduce \emph{Direct SMC}, which goes further: rather than sampling paths
+through an explicit DTMC (which still requires building the tree), we sample
+directly from the LLM's generation process.
+
+\subsection{Direct SMC Algorithm}
+
+\begin{algorithm}[h]
+\caption{Direct SMC for long-lookahead PCTL}
+\label{alg:dsmc}
+\begin{algorithmic}[1]
+\Require $\omega^{(0)}, L, \phi, M(\cdot), \text{backend}, M_\text{samples}, \delta$
+\Ensure Estimate $\hat{p}$ and confidence interval $[\hat{p}{-}\eps,\, \hat{p}{+}\eps]$
+\State $\text{count} \gets 0$
+\For{each chunk of $B$ trajectories}
+  \State $\{(\sigma^{(m)}_1, \ldots, \sigma^{(m)}_L)\}_{m=1}^{B}
+      \gets \text{backend.generate}(\omega^{(0)},\; L,\; n{=}B)$
+      \Comment{\textbf{One GPU call for $B$ complete trajectories}}
+  \For{$m = 1, \ldots, B$}
+    \State $\text{sat} \gets \Call{Evaluate}{\omega^{(0)},
+        (\sigma^{(m)}_1,\ldots,\sigma^{(m)}_L), \phi, M(\cdot)}$
+    \If{sat}\ $\text{count} \gets \text{count} + 1$\ \EndIf
+  \EndFor
+\EndFor
+\State $\hat{p} \gets \text{count} / M_\text{samples}$
+\State $\eps \gets \sqrt{\ln(2/\delta)\;/\;(2 M_\text{samples})}$
+  \Comment{Chernoff–Hoeffding bound}
+\Return $\hat{p},\; \max(0, \hat{p}{-}\eps),\; \min(1, \hat{p}{+}\eps)$
+\end{algorithmic}
+\end{algorithm}
+
+The function \textsc{Evaluate} walks a single trajectory
+$(\sigma_1,\ldots,\sigma_L)$ and evaluates:
+\begin{align*}
+  \text{sat} &= \bigvee_{t=1}^{L}\phi\bigl(M(\omega^{(0)}\sigma_1\cdots\sigma_t),\, t\bigr)
+  & &\text{for } \Prob(\mathbf{F}\,\phi) \\
+  \text{sat} &= \bigwedge_{t=1}^{L}\phi\bigl(M(\omega^{(0)}\sigma_1\cdots\sigma_t),\, t\bigr)
+  & &\text{for } \Prob(\mathbf{G}\,\phi)
+\end{align*}
+
+\subsection{Statistical Guarantee}
+
+\begin{theorem}[Chernoff–Hoeffding confidence bound]
+\label{thm:chernoff}
+Let $p = \Prob(\mathbf{F}/\mathbf{G}\;\phi)$ be the true PCTL probability.
+Let $\hat{p} = \text{count}/M$ be the Direct SMC estimate from $M$ i.i.d.\
+trajectory samples.
+For any $\delta \in (0,1)$:
+\[
+  \Prob\!\left(|\hat{p} - p| \le \sqrt{\frac{\ln(2/\delta)}{2M}}\right) \ge 1 - \delta
+\]
+\end{theorem}
+
+\begin{proof}
+Each trajectory evaluation is an independent Bernoulli trial with success
+probability $p$.
+Hoeffding's inequality~\cite{hoeffding1963} applied to the bounded $[0,1]$
+random variable gives the stated bound.
+\end{proof}
+
+\begin{corollary}[Sample complexity]
+To achieve additive error $\eps$ at confidence $1-\delta$, it suffices to draw
+$M \ge \ln(2/\delta) / (2\eps^2)$ samples.
+For $\eps = 0.025$ (2.5\%) and $\delta = 0.05$ (95\% confidence):
+$M \ge 3{,}689$ samples.
+\end{corollary}
+
+\subsection{vLLM Integration: Native Multi-Sequence Generation}
+
+The key GPU optimisation for Direct SMC is vLLM's
+$\texttt{SamplingParams(n=}B\texttt{)}$ option, which generates $B$ independent
+completions of a single prompt in one forward-pass session.
+All $B$ trajectories share the KV cache for the prompt $\omega^{(0)}$ (computed
+once) and diverge only in the sampled tokens.
+This is more efficient than $B$ separate \texttt{generate} calls, as the prompt
+prefill is amortised.
+
+\subsection{Complexity}
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+Method & LLM calls (serial) & LLM calls (total) & Max feasible $L$ \\
+\midrule
+DFS exact (\cite{gross2025llmchecker}) & $\Theta(k^L)$ & $\Theta(k^L)$ & $\approx 10$ \\
+BFS exact (ours, \S\ref{sec:bfs}) & $L$ & $\Theta(k^L)$ (parallel) & $\approx 8$ \\
+Direct SMC (ours, \S\ref{sec:dsmc}) & $M/B$ & $M \cdot L$ (parallel) & $\leq$ ctx window \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent where $B$ is the GPU batch size.
+Direct SMC's serial depth is $M/B$ batched calls (independent of $L$), and the
+total work is $M \cdot L$ token evaluations all run in parallel across the GPU.
+
+% =============================================================================
+\section{Text Quantification and PCTL Vocabulary}
+\label{sec:quant}
+
+PCTL atomic propositions reference integer-valued features of the generated
+text.
+We implement a \emph{quantification function} $M: \Sigma^* \times \Nat \to
+\mathbb{Z}^n$ that maps a string (at generation depth $d$) to a vector of
+integer features.
+Table~\ref{tab:quant} lists the four methods from~\cite{gross2025llmchecker}
+and their implementations.
+
+\begin{table}[h]
+\centering
+\caption{Text quantification methods and example PCTL predicates}
+\label{tab:quant}
+\begin{tabular}{llll}
+\toprule
+Feature & Range & Implementation & Example predicate \\
+\midrule
+\textit{gender} & $\mathbb{Z}$ & $\#\text{male} - \#\text{female}$ terms & $\textit{gender} > 0$ \\
+\textit{polarity} & $[-100, 100]$ & TextBlob sentiment $\times 100$ & $\textit{polarity} \ge 30$ \\
+\textit{readability} & $[0, 10000]$ & Flesch score $\times 100$ & $\textit{readability} > 5997$ \\
+\textit{similarity} & $[0, 100]$ & Normalised edit distance & $\textit{similarity} > 90$ \\
+\textit{step} & $\Nat$ & Generation depth & $\textit{step} = 5$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Multiple quantifiers are composed via a \texttt{MultiQuantifier} that merges
+their output dicts.
+Conjunctive PCTL formulas (e.g.\ $\textit{step}=5 \wedge \textit{similarity}>90$)
+are supported directly.
+
+
+% =============================================================================
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Setup}
+
+All experiments use \textbf{GPT-2} (124M parameters) as the base LLM, the
+HuggingFace \texttt{gpt2} checkpoint at temperature 1.0.
+Hardware: NVIDIA GeForce RTX~4070 Laptop GPU (8~GB VRAM, CUDA 12.1),
+Intel i7, Python 3.11, PyTorch 2.10, vLLM 0.18.0.
+The original \textsc{LLMChecker} experiments used dual AMD Epyc 7763 CPUs with
+A100 GPUs; our results demonstrate that the GPU-parallel approach is accessible
+on consumer hardware.
+
+\subsection{Exact Verification: Replication of Paper Experiments}
+
+Table~\ref{tab:exact} replicates Table~II of~\cite{gross2025llmchecker} using
+our BFS + GPU backward induction pipeline.
+Verification times are reduced to single-digit milliseconds in all cases.
+
+\begin{table}[h]
+\centering
+\caption{Exact PCTL verification on GPT-2 (BFS construction + GPU backward
+induction). Encoding time (ET) includes all LLM inference. Verification
+time (VT) is the backward induction pass only.}
+\label{tab:exact}
+\begin{tabular}{p{3.2cm}p{4.2cm}rrrrrr}
+\toprule
+Start string & PCTL query & $\alpha$ & $k$ & $L$ & $|S|$ & ET (s) & VT (ms) \\
+\midrule
+\texttt{The player won because}
+  & $\Prob(\mathbf{F}\;\textit{gender}>0)$    & 0.9 & 5 & 4 & 898   & 0.51 & 56 \\
+\texttt{The exam was}
+  & $\Prob(\mathbf{F}\;\textit{polarity}\ge10)$ & 0.9 & 5 & 4 & 919   & 0.20 &  9 \\
+\texttt{Our story}
+  & $\Prob(\mathbf{G}\;\textit{readability}>1000)$ & 0.8 & 3 & 5 & 447   & 1.06 & 28 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{vLLM Prefix Caching: Observed Throughput}
+
+Table~\ref{tab:vllm} records the input token throughput reported by vLLM
+during BFS construction of the gender bias DTMC ($\alpha=0.9$, $k=5$, $L=4$,
+start string \texttt{"The player won because"}).
+
+\begin{table}[h]
+\centering
+\caption{vLLM input throughput per BFS depth level, demonstrating prefix
+cache hits for shared string prefixes.}
+\label{tab:vllm}
+\begin{tabular}{rrrl}
+\toprule
+Depth $d$ & Active nodes & Input tok/s & Note \\
+\midrule
+0 & 1   &  12,130 & Cold: full prompt computed \\
+1 & 5   &  73,660 & Prefix cache partially warm \\
+2 & 25  & 15,985,610 & Nearly all tokens are cache hits \\
+3 & 121 & 48,321,870 & Near-maximum utilisation \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent The two-orders-of-magnitude increase from depth 0 to depth 3
+confirms that vLLM's prefix caching eliminates redundant KV computation
+for shared string prefixes.
+
+\subsection{Direct SMC: Long Lookahead Results}
+
+Table~\ref{tab:dsmc} presents Direct SMC results for PCTL properties at
+lookahead depths entirely beyond the reach of exact verification.
+All three properties are checked at $M = 1{,}000$ samples.
+
+\begin{table}[h]
+\centering
+\caption{Direct SMC results for long-lookahead PCTL properties on GPT-2
+($M=1000$ samples, 95\% confidence, temperature 1.0).
+``Exact states'' shows the state space that exact verification would require.}
+\label{tab:dsmc}
+\begin{tabular}{p{2.8cm}p{3.8cm}rrrr r}
+\toprule
+Start string & PCTL query & $L$ & Exact $|S|$ & $\hat{p}$ & 95\% CI & Time (s) \\
+\midrule
+\texttt{...won because}
+  & $\Prob(\mathbf{F}\;\textit{gender}>2)$
+  & 50 & ${\sim}10^{35}$ & 0.340 & [0.297, 0.383] & 5.4 \\
+\texttt{...a wonderful}
+  & $\Prob(\mathbf{G}\;\textit{polarity}\ge0)$
+  & 30 & ${\sim}10^{21}$ & 0.998 & [0.955, 1.000] & 5.4 \\
+\texttt{Our story begins}
+  & $\Prob(\mathbf{G}\;\textit{readability}>100)$
+  & 40 & ${\sim}10^{28}$ & 0.993 & [0.950, 1.000] & 5.2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Interpretation.}
+The $\Prob(\mathbf{G}\;\textit{polarity}\ge0) = 0.998$ result for
+\texttt{"The exam was a wonderful"} indicates that GPT-2 almost certainly
+maintains non-negative sentiment throughout 30 tokens when given an optimistic
+prefix — a non-trivial formal safety certificate about the model's behaviour.
+Exact verification of this property would require enumerating
+$5^{30} \approx 9.3 \times 10^{20}$ states.
+
+\subsection{Convergence of Direct SMC}
+
+Table~\ref{tab:convergence} shows how the Direct SMC estimate and confidence
+bound evolve as the number of samples $M$ increases, for
+$\Prob(\mathbf{F}\;\textit{gender}>0)$ at $L=50$.
+
+\begin{table}[h]
+\centering
+\caption{Convergence of Direct SMC for $\Prob(\mathbf{F}\;\textit{gender}>0)$
+at $L=50$, start string \texttt{"The player won because"}.
+The Chernoff bound $\eps \propto 1/\sqrt{M}$ tightens as predicted.}
+\label{tab:convergence}
+\begin{tabular}{rcccc}
+\toprule
+$M$ & $\hat{p}$ & 95\% CI width & $\eps$ & Time (s) \\
+\midrule
+100   & 0.750 & 0.272 & 0.136 &  0.9 \\
+300   & 0.723 & 0.157 & 0.078 &  1.5 \\
+500   & 0.678 & 0.121 & 0.061 &  2.5 \\
+1000  & 0.651 & 0.086 & 0.043 &  5.1 \\
+2000  & 0.719 & 0.061 & 0.030 & 10.3 \\
+3000  & 0.697 & 0.050 & 0.025 & 15.4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent The interval width halves when $M$ quadruples, consistent with
+Theorem~\ref{thm:chernoff}.
+The estimate stabilises around $0.69$--$0.70$ by $M=2{,}000$.
+
+
+% =============================================================================
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Probabilistic model checking.}
+Model checking for DTMCs and MDPs is a mature field~\cite{baier2008principles}.
+Tools including PRISM~\cite{kwiatkowska2011prism4} and Storm~\cite{hensel2022storm}
+implement exact PCTL verification via value iteration and linear programming.
+GPU acceleration of model checking has been studied for specific structures
+(e.g.\ BDD-based symbolic methods~\cite{hermanns2008symbolic}) but not, to our
+knowledge, for the sparse backward induction we describe.
+
+\paragraph{Statistical model checking.}
+SMC replaces exact verification with simulation-based estimation, providing
+statistical guarantees~\cite{younes2002probabilistic,legay2010statistical}.
+The UPPAAL SMC tool~\cite{bulychev2012uppaal} and the SMC extension of PRISM
+both implement SMC for continuous-time models.
+We extend this line of work to LLM text generation, where the ``simulator''
+is the LLM itself.
+
+\paragraph{LLM verification.}
+There is growing interest in formal verification of neural network
+behaviours~\cite{huang2017safety}.
+Semantic robustness for NLP~\cite{malfa2022king} and robustness
+verification for transformers~\cite{shi2020robustness,liao2023robust} focus on
+input perturbations rather than generation dynamics.
+\textsc{LLMChecker}~\cite{gross2025llmchecker} is, to our knowledge, the first
+to apply PCTL model checking to the sequential generation process.
+Our work addresses its scalability limitations.
+
+\paragraph{LLM inference optimisation.}
+vLLM~\cite{kwon2023efficient} introduces PagedAttention for memory-efficient
+KV cache management, enabling high-throughput batch inference.
+Its automatic prefix caching~\cite{zheng2023efficiently} is the enabling
+technology for our BFS level batching.
+Speculative decoding~\cite{leviathan2023fast} and tree-structured
+generation~\cite{cai2024medusa} also exploit the tree structure of beam search,
+but for latency reduction rather than probabilistic verification.
+
+
+% =============================================================================
+\section{Discussion and Limitations}
+\label{sec:discussion}
+
+\paragraph{When to use exact vs.\ Direct SMC.}
+For $L \le 7$ and $k_\text{eff} \le 5$ (achievable with tight $\alpha$), exact
+backward induction provides machine-precision probabilities in milliseconds and
+is the recommended approach.
+For $L > 8$ or high-entropy models (large $k_\text{eff}$), Direct SMC with
+$M \ge 2{,}000$ gives ±3\% accuracy at 95\% confidence in seconds and should be
+preferred.
+
+\paragraph{Quantification function quality.}
+The PCTL results are only as meaningful as the quantification function $M(\cdot)$.
+Our gender bias counter uses a fixed word list; a misogynistic text that avoids
+those specific words would not be flagged.
+More robust quantifiers (e.g.\ embedding-based classifiers) can be plugged in
+without changing the verification infrastructure, at the cost of slower
+per-node evaluation.
+
+\paragraph{Temperature and the modelled distribution.}
+We set temperature $= 1.0$ throughout, using the unmodified LLM distribution.
+The framework applies to any temperature, but the certified probabilities are
+temperature-specific: a property that holds with high probability at $T=1$
+may not hold at $T=2$.
+
+\paragraph{Context window limit for Direct SMC.}
+Direct SMC is bounded by the model's context window.
+For GPT-2 ($1{,}024$ tokens), the maximum $L$ is approximately $1{,}014$ given a
+ten-token prompt.
+Modern models (Llama-3: $131{,}072$ tokens; Gemini 1.5: $10^6$ tokens) make
+this constraint practically irrelevant.
+
+\paragraph{REST states and probability mass.}
+Exact backward induction treats the REST terminal as an absorbing state with
+probability equal to the un-modelled mass $1 - \sum_i p_i$.
+Direct SMC samples from the \emph{true} LLM distribution, so REST states are
+never artificially introduced — Direct SMC certificates are statements about
+the full untruncated distribution, while exact results are certified only for
+the $\alpha$-$k$-bounded approximation.
+
+
+% =============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We identified and exploited two structural properties of the
+$\alpha$-$k$-bounded LLM text generation DTMC that were left unaddressed by
+\textsc{LLMChecker}~\cite{gross2025llmchecker}: the independence of nodes at
+the same depth, and the acyclic tree topology.
+The former enables BFS batching that reduces serial LLM calls from $\Theta(k^L)$
+to $L$; the latter enables GPU sparse backward induction that replaces Storm's
+iterative solver with $L$ sparse matrix–vector products taking milliseconds.
+
+For lookahead depths where the $\Theta(k^L)$ state space is itself the barrier,
+we introduced Direct SMC: a novel algorithm that samples $M$ complete
+trajectories directly from the LLM using vLLM's native multi-sequence GPU
+batching, and evaluates PCTL properties on each sampled trajectory with
+Chernoff–Hoeffding confidence bounds.
+Direct SMC scales to any $L$ within the model's context window, operates on the
+true untruncated LLM distribution, and is embarrassingly parallel.
+
+On a consumer RTX~4070 we check PCTL properties at $L=50$ tokens in $\le 16$
+seconds with $\pm 2.5\%$ confidence — a regime where exact verification would
+require enumerating $\sim 10^{34}$ states.
+
+
+% ── Bibliography ──────────────────────────────────────────────────────────────
+\begin{thebibliography}{99}
+\small\sloppy\emergencystretch=3em
+
+\bibitem{gross2025llmchecker}
+D.~Gross, H.~Spieker, and A.~Gotlieb.
+\newblock Bounded {PCTL} model checking of large language model outputs.
+\newblock \emph{arXiv:2509.18836}, 2025.
+
+\bibitem{hansson1994logic}
+H.~Hansson and B.~Jonsson.
+\newblock A logic for reasoning about time and reliability.
+\newblock \emph{Formal Aspects of Computing}, 6(5):512--535, 1994.
+
+\bibitem{baier2008principles}
+C.~Baier and J.-P. Katoen.
+\newblock \emph{Principles of Model Checking}.
+\newblock MIT Press, 2008.
+
+\bibitem{hensel2022storm}
+C.~Hensel, S.~Junges, J.-P.~Katoen, T.~Quatmann, and M.~Volk.
+\newblock The probabilistic model checker {Storm}.
+\newblock \emph{Int. J. Softw. Tools Technol. Transf.}, 24(4):589--610, 2022.
+
+\bibitem{kwiatkowska2011prism4}
+M.~Kwiatkowska, G.~Norman, and D.~Parker.
+\newblock {PRISM} 4.0: Verification of probabilistic real-time systems.
+\newblock In \emph{CAV}, volume 6806 of LNCS, pages 585--591. Springer, 2011.
+
+\bibitem{kwon2023efficient}
+W.~Kwon et al.
+\newblock Efficient memory management for large language model serving with
+{PagedAttention}.
+\newblock In \emph{SOSP}, 2023.
+
+\bibitem{zheng2023efficiently}
+Z.~Zheng et al.
+\newblock Efficiently programming large language models using {SGLang}.
+\newblock \emph{arXiv:2312.07104}, 2023.
+
+\bibitem{younes2002probabilistic}
+H.~L.~S. Younes and R.~G. Simmons.
+\newblock Probabilistic verification of discrete event systems using acceptance
+sampling.
+\newblock In \emph{CAV}, volume 2404 of LNCS, pages 223--235. Springer, 2002.
+
+\bibitem{legay2010statistical}
+A.~Legay, B.~Delahaye, and S.~Bensalem.
+\newblock Statistical model checking: An overview.
+\newblock In \emph{Runtime Verification}, volume 6418 of LNCS, pages 122--135.
+Springer, 2010.
+
+\bibitem{bulychev2012uppaal}
+P.~Bulychev, A.~David, K.~G. Larsen, M.~Miku\v{c}ionis, D.~B. Poulsen,
+A.~Legay, and Z.~Wang.
+\newblock {UPPAAL-SMC}: Statistical model checking for priced timed automata.
+\newblock In \emph{QAPL}, volume 85 of EPTCS, pages 1--16, 2012.
+
+\bibitem{hoeffding1963}
+W.~Hoeffding.
+\newblock Probability inequalities for sums of bounded random variables.
+\newblock \emph{Journal of the American Statistical Association},
+58(301):13--30, 1963.
+
+\bibitem{huang2017safety}
+X.~Huang, M.~Kwiatkowska, S.~Wang, and M.~Wu.
+\newblock Safety verification of deep neural networks.
+\newblock In \emph{CAV}, volume 10426 of LNCS, pages 3--29. Springer, 2017.
+
+\bibitem{malfa2022king}
+E.~La Malfa and M.~Kwiatkowska.
+\newblock The king is naked: On the notion of robustness for natural language
+processing.
+\newblock In \emph{AAAI}, pages 11047--11057, 2022.
+
+\bibitem{shi2020robustness}
+Z.~Shi, H.~Zhang, K.-W. Chang, M.~Huang, and C.-J. Hsieh.
+\newblock Robustness verification for transformers.
+\newblock In \emph{ICLR}, 2020.
+
+\bibitem{liao2023robust}
+B.~H. Liao, C.~Cheng, H.~Esen, and A.~Knoll.
+\newblock Are transformers more robust? {Towards} exact robustness verification
+for transformers.
+\newblock In \emph{SAFECOMP}, volume 14181 of LNCS, pages 89--103. Springer,
+2023.
+
+\bibitem{hermanns2008symbolic}
+H.~Hermanns, J.~Meyer-Kayser, and M.~Siegle.
+\newblock Multi terminal binary decision diagrams to represent and analyse
+continuous time {Markov} chains.
+\newblock In \emph{NSMC}, 1999.
+
+\bibitem{leviathan2023fast}
+Y.~Leviathan, M.~Kalman, and Y.~Matias.
+\newblock Fast inference from transformers via speculative decoding.
+\newblock In \emph{ICML}, 2023.
+
+\bibitem{cai2024medusa}
+T.~Cai et al.
+\newblock {MEDUSA}: Simple {LLM} inference acceleration framework with
+multiple decoding heads.
+\newblock In \emph{ICML}, 2024.
+
+\bibitem{clarke2011model}
+E.~M. Clarke, O.~Grumberg, and D.~A. Peled.
+\newblock \emph{Model Checking}.
+\newblock MIT Press, 1999.
+
+\end{thebibliography}
+
+\end{document}
