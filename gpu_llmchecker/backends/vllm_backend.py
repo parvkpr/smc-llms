@@ -50,6 +50,9 @@ class VLLMBackend:
     tensor_parallel_size   : number of GPUs for tensor parallelism
     dtype             : weight dtype ('auto', 'float16', 'bfloat16')
     enable_prefix_caching  : share KV cache across requests with common prefixes
+    sampling_top_p    : nucleus sampling threshold applied to the LLM
+                        distribution before α-k bounding (1.0 = off)
+    sampling_top_k    : hard-cap on top-k sampling before α-k bounding (-1 = off)
     extra_llm_kwargs  : forwarded verbatim to vllm.LLM(...)
     """
 
@@ -62,6 +65,8 @@ class VLLMBackend:
         dtype: str = "auto",
         enable_prefix_caching: bool = True,
         max_batch_size: int = 32_768,   # chunk large BFS levels into this many strings
+        sampling_top_p: float = 1.0,
+        sampling_top_k: int = -1,
         **extra_llm_kwargs,
     ) -> None:
         if not _VLLM_AVAILABLE:
@@ -72,6 +77,8 @@ class VLLMBackend:
 
         self.max_logprobs = max_logprobs
         self.model_name = model_name
+        self.sampling_top_p = sampling_top_p
+        self.sampling_top_k = sampling_top_k
 
         self.max_batch_size = max_batch_size
         self.llm = LLM(
@@ -80,8 +87,9 @@ class VLLMBackend:
             gpu_memory_utilization=gpu_memory_utilisation,
             tensor_parallel_size=tensor_parallel_size,
             enable_prefix_caching=enable_prefix_caching,
-            # Disable sampling randomness — we want the raw distribution
-            # (temperature is handled per-request via SamplingParams)
+            # torch.compile in vLLM ≥0.18 has a FakeTensorMode incompatibility
+            # with torch 2.10; eager mode is slightly slower but always correct.
+            enforce_eager=True,
             **extra_llm_kwargs,
         )
 
@@ -93,6 +101,8 @@ class VLLMBackend:
         alpha: float,
         k: int,
         temperature: float = 1.0,
+        top_p: Optional[float] = None,
+        top_k_sampling: Optional[int] = None,
     ) -> List[Tuple[List[str], List[float]]]:
         """
         For each string in the batch return (token_strings, probabilities)
@@ -102,8 +112,11 @@ class VLLMBackend:
         enabled, siblings that share a common prefix only pay the KV cost
         for their diverging suffix.
 
-        alpha : cumulative probability threshold  ∈ (0, 1]
-        k     : hard cap on number of tokens returned
+        alpha          : cumulative probability threshold  ∈ (0, 1]
+        k              : hard cap on number of tokens returned
+        temperature    : softmax temperature applied to logits
+        top_p          : nucleus sampling threshold (overrides instance default)
+        top_k_sampling : hard top-k sampling cap (overrides instance default)
         """
         if k > self.max_logprobs:
             raise ValueError(
@@ -111,14 +124,16 @@ class VLLMBackend:
                 f"Re-initialise VLLMBackend with max_logprobs >= {k}."
             )
 
+        effective_top_p = top_p if top_p is not None else self.sampling_top_p
+        effective_top_k = top_k_sampling if top_k_sampling is not None else self.sampling_top_k
+
         sampling_params = SamplingParams(
             n=1,
             max_tokens=1,        # one-step lookahead only
             logprobs=k,          # return top-k log-probabilities
             temperature=temperature,
-            # Disable all sampling truncation — we want the full distribution
-            top_p=1.0,
-            top_k=-1,
+            top_p=effective_top_p,
+            top_k=effective_top_k,
         )
 
         # Chunk large BFS levels so GPU VRAM is never oversubscribed.

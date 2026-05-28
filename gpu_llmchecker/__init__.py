@@ -33,9 +33,22 @@ from .quantification import (
     CopyrightSim,
     StepCounter,
     MultiQuantifier,
+    KeywordPresence,
+    ForbiddenWordChecker,
+    FormatConstraint,
+    ToxicityHeuristic,
+    RefusalDetector,
+    HarmBenchClassifier,
+    ClassifierQuantifier,
 )
 from .bfs_builder import build_dtmc_bfs
-from .verification import exact_backward_induction, statistical_model_check, direct_smc
+from .verification import (
+    exact_backward_induction,
+    exact_backward_induction_semantic,
+    statistical_model_check,
+    direct_smc,
+    smc_resampled,
+)
 
 __all__ = [
     "LLMCheckerGPU",
@@ -52,8 +65,17 @@ __all__ = [
     "CopyrightSim",
     "StepCounter",
     "MultiQuantifier",
+    "KeywordPresence",
+    "ForbiddenWordChecker",
+    "FormatConstraint",
+    "ToxicityHeuristic",
+    "RefusalDetector",
+    "HarmBenchClassifier",
+    "ClassifierQuantifier",
     "build_dtmc_bfs",
     "exact_backward_induction",
+    "exact_backward_induction_semantic",
     "statistical_model_check",
     "direct_smc",
+    "smc_resampled",
 ]

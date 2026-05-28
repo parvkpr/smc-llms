@@ -1,0 +1,100 @@
+# ─── Python bytecode / build artifacts ───────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+build/
+dist/
+.eggs/
+pip-wheel-metadata/
+*.whl
+
+# ─── Virtual environments ────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ─── Editor / IDE / OS noise ─────────────────────────────────────────────────
+.vscode/
+.idea/
+.cursor/
+.claude/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ─── Notebooks ───────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ─── Backup / scratch files ──────────────────────────────────────────────────
+*.bak
+*.tmp
+*.orig
+*~
+.#*
+\#*\#
+
+# ─── Logs and run outputs ────────────────────────────────────────────────────
+*.log
+nohup.out
+slurm-*.out
+
+# ─── Large generated artifacts (experiment outputs and figures) ──────────────
+# These are reproducible from the scripts; check them in selectively with
+# `git add -f` if a specific JSON should be tracked.
+results/
+results_*.json
+*.npz
+*.pt
+*.pth
+*.ckpt
+figure_*.pdf
+figure_*.png
+
+# ─── Hugging Face / model caches that sometimes spill into the workspace ─────
+.cache/
+hf_cache/
+transformers_cache/
+
+# ─── Secrets and local config ────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+secrets/
+*.key
+*.pem
+
+# ─── Test / coverage output ──────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# ─── LaTeX intermediate files ────────────────────────────────────────────────
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.lof
+*.lot
+*.out
+*.synctex.gz
+*.toc
+*.dvi
+*.run.xml
+*-blx.bib
+
+# ─── Other workspace-specific scratch ────────────────────────────────────────
+LLM_Probabilistic_Verification_Conference_Paper_Plan.docx
+beyond_attack_success_rate_blog.txt
+gpu_llmchecker/*.html.bak

@@ -21,10 +21,14 @@ class HFBackend:
     """
     Parameters
     ----------
-    model_name  : HuggingFace model id or local path
-    device      : 'cuda', 'cpu', or 'auto' (uses device_map='auto')
-    dtype       : torch dtype for model weights (default: float16 on CUDA)
-    batch_size  : max strings per forward pass (tune to fit VRAM)
+    model_name     : HuggingFace model id or local path
+    device         : 'cuda', 'cpu', or 'auto' (uses device_map='auto')
+    dtype          : torch dtype for model weights (default: float16 on CUDA)
+    batch_size     : max strings per forward pass (tune to fit VRAM)
+    sampling_top_p : nucleus sampling threshold applied before α-k bounding
+                     (1.0 = disabled; carried as default for generate calls)
+    sampling_top_k : hard-cap for top-k sampling before α-k bounding
+                     (-1 = disabled)
     """
 
     def __init__(
@@ -33,11 +37,15 @@ class HFBackend:
         device: str = "auto",
         dtype: Optional[torch.dtype] = None,
         batch_size: int = 8,
+        sampling_top_p: float = 1.0,
+        sampling_top_k: int = -1,
     ) -> None:
         from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore
 
         self.batch_size = batch_size
         self.model_name = model_name
+        self.sampling_top_p = sampling_top_p
+        self.sampling_top_k = sampling_top_k
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name, padding_side="left"
@@ -66,11 +74,17 @@ class HFBackend:
         alpha: float,
         k: int,
         temperature: float = 1.0,
+        top_p: Optional[float] = None,
+        top_k_sampling: Optional[int] = None,
     ) -> List[Tuple[List[str], List[float]]]:
+        effective_top_p = top_p if top_p is not None else self.sampling_top_p
+        effective_top_k = top_k_sampling if top_k_sampling is not None else self.sampling_top_k
         results: List[Tuple[List[str], List[float]]] = []
         for i in range(0, len(strings), self.batch_size):
             chunk = strings[i : i + self.batch_size]
-            results.extend(self._process_chunk(chunk, alpha, k, temperature))
+            results.extend(
+                self._process_chunk(chunk, alpha, k, temperature, effective_top_p, effective_top_k)
+            )
         return results
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -81,6 +95,8 @@ class HFBackend:
         alpha: float,
         k: int,
         temperature: float,
+        top_p: float = 1.0,
+        top_k_sampling: int = -1,
     ) -> List[Tuple[List[str], List[float]]]:
         enc = self.tokenizer(
             strings,
@@ -102,12 +118,33 @@ class HFBackend:
 
         for i in range(len(strings)):
             pos = last_real_pos[i].item()
-            logits = out.logits[i, pos]  # [vocab_size]
+            logits = out.logits[i, pos].clone()  # [vocab_size]
 
-            if temperature != 1.0:
+            if temperature != 1.0 and temperature > 0:
                 logits = logits / temperature
 
-            log_probs = torch.log_softmax(logits, dim=-1)
+            # Apply top-k truncation to logits before softmax
+            if top_k_sampling > 0:
+                top_k_cap = min(top_k_sampling, vocab_size)
+                kth_val = torch.topk(logits, top_k_cap).values[-1]
+                logits = logits.masked_fill(logits < kth_val, float("-inf"))
+
+            probs_full = torch.softmax(logits, dim=-1)
+
+            # Apply nucleus (top-p) filtering
+            if top_p < 1.0:
+                sorted_probs, sorted_idx = torch.sort(probs_full, descending=True)
+                cum_probs = torch.cumsum(sorted_probs, dim=0)
+                # Remove tokens with cumulative prob above threshold (keep first token)
+                remove_mask = cum_probs - sorted_probs > top_p
+                sorted_probs[remove_mask] = 0.0
+                probs_full = torch.zeros_like(probs_full)
+                probs_full.scatter_(0, sorted_idx, sorted_probs)
+                s = probs_full.sum()
+                if s > 0:
+                    probs_full = probs_full / s
+
+            log_probs = torch.log(probs_full.clamp(min=1e-45))
             top_log_probs, top_ids = torch.topk(log_probs, effective_k)
 
             tokens: List[str] = []
@@ -115,6 +152,8 @@ class HFBackend:
             cumulative = 0.0
 
             for tid, lp in zip(top_ids.tolist(), top_log_probs.tolist()):
+                if lp == float("-inf"):
+                    break
                 prob = math.exp(lp)
                 token_str = self.tokenizer.decode([tid])
                 tokens.append(token_str)

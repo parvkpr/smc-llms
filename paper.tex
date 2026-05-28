@@ -1,0 +1,654 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{mathtools}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{hyperref}
+\usepackage[nameinlink,noabbrev]{cleveref}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!55!black,
+  citecolor=blue!55!black,
+  urlcolor=blue!55!black
+}
+
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+
+\newcommand{\Prob}{\mathbb{P}}
+\newcommand{\Exp}{\mathbb{E}}
+\newcommand{\calS}{\mathcal{S}}
+\newcommand{\calT}{\mathcal{T}}
+\newcommand{\calV}{\mathcal{V}}
+\newcommand{\calB}{\mathcal{B}}
+\newcommand{\calD}{\mathcal{D}}
+\newcommand{\calJ}{\mathcal{J}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\argmax}{\operatorname*{arg\,max}}
+\newcommand{\ind}{\mathbf{1}}
+\newcommand{\harm}{\texttt{harm}}
+\newcommand{\safe}{\texttt{safe}}
+\newcommand{\refusal}{\texttt{refusal}}
+\newcommand{\BCA}{\textsc{BCA}}
+\newcommand{\ASR}{\textsc{ASR}}
+\newcommand{\SMC}{\textsc{SMC}}
+\newcommand{\DTMC}{\textsc{DTMC}}
+
+\title{\vspace{-1.5em}
+Beyond Attack Success Rate:\\
+Estimating Hidden Harmful Probability Mass in LLM Outputs}
+
+\author{
+Parv Kapoor\\
+Carnegie Mellon University\\
+\texttt{parvkpr.github.io}
+}
+
+\date{Technical Report}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Standard jailbreak evaluation usually asks an outcome-level question: did a sampled model response contain harmful content?  This question is necessary, and benchmarks such as HarmBench and JailbreakBench have made it substantially more reproducible by standardizing behaviors, prompts, threat models, judges, and attack success-rate metrics.  However, sampled attack success rate is incomplete.  It measures realized completions, not the conditional output distribution that produced them.  A model may refuse under greedy decoding while assigning nontrivial probability mass to nearby harmful continuations; conversely, a defense may reduce sampled attack success while leaving the harmful probability mass largely intact.
+
+We propose \emph{bounded continuation analysis} (\BCA), a distributional diagnostic for LLM safety evaluation.  Given a prompt, a model, a horizon $L$, a top-$k$ cap, and a cumulative probability threshold $\alpha$, \BCA constructs an $\alpha$-$k$ bounded continuation tree, labels terminal continuations with a semantic harm judge, and computes the probability of eventually reaching a harmful state in the bounded process.  For small trees this probability is computed exactly by sparse backward induction over the induced finite \DTMC; for larger sweeps it is estimated by statistical model checking with confidence bounds.  Across JailbreakBench behaviors and four instruction-tuned models, \BCA reveals harmful probability mass that greedy \ASR misses, distinguishes models that all score greedy \ASR{} $=0$, identifies jailbreak-template families that unlock hidden mass, and predicts empirical attack success with Spearman $\rho=0.66$.  These results support a diagnostic reframe: not merely \emph{did the model jailbreak?}, but \emph{how much harmful probability mass is nearby, where does refusal break, and which templates expose the most hidden mass?}
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+Large-language-model safety evaluation is often operationalized as a binary classification problem.  Given a harmful behavior and an adversarial prompt, the model is sampled, the response is judged, and the run is counted as either a successful attack or a refusal/safe response.  The resulting attack success rate (\ASR) is easy to report, easy to compare, and central to modern red-team evaluation.
+
+This framing is useful, but it is only a view of the sampled surface.  Autoregressive language models define distributions over continuations.  A single decoded response, even a greedy one, observes only one path through that distribution.  Two models can therefore have identical sampled \ASR{} and radically different local safety structure.  One may refuse because nearly all likely continuations route to refusal.  Another may refuse only on the modal path while assigning substantial mass to lower-probability continuations that become harmful.  From the perspective of deployment risk, debugging, and model comparison, those are different systems.
+
+This paper asks whether jailbreak evaluation can expose that hidden structure.  Instead of measuring only whether a sampled completion is harmful, we estimate the probability mass assigned to harmful continuations within a bounded neighborhood of the model's output distribution.  We call this \emph{bounded continuation analysis} (\BCA).  The core idea is to view autoregressive generation as a finite-horizon discrete-time Markov chain over token-prefix states.  The full chain is intractable, so we construct an $\alpha$-$k$ bounded tree: at each prefix, we retain the most probable next tokens up to a cap $k$ and cumulative mass threshold $\alpha$, renormalize the retained edges, and continue to depth $L$.  A semantic harm judge labels terminal continuations; reachability analysis then computes $\Prob[\mathbf{F}\,\harm]$, the probability that the bounded process eventually reaches a harmful state.
+
+This is not a proof of global safety.  It is local to a prompt, model, decoding process, horizon, bounding rule, and evaluator.  That narrower claim is still useful, because ordinary evaluation often observes only a handful of samples.  \BCA{} gives a second-stage diagnostic for prompts where the visible output looks safe but the distribution remains fragile.
+
+\paragraph{Contributions.}
+We make four contributions.
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item We formalize bounded continuation analysis for adversarial LLM evaluation as finite-horizon reachability over an $\alpha$-$k$ bounded \DTMC{} induced by an autoregressive model.
+  \item We define semantic harmful-mass metrics, including $\Prob[\mathbf{F}\,\harm]$, refusal-collapse probability, and bounded safety probability, and show how to compute them by exact backward induction or statistical model checking.
+  \item We evaluate the method on JailbreakBench harmful behaviors using Qwen2.5-1.5B-Instruct, Qwen2.5-7B-Instruct, Mistral-7B-Instruct-v0.2, and Llama-3.1-8B-Instruct, with Qwen2.5-7B used as the semantic harm judge in semantic experiments.
+  \item We show that bounded harmful mass reveals hidden risk invisible to greedy \ASR, separates models that all score greedy \ASR{} $=0$, provides a useful gradient-free search signal for jailbreak-template selection, and predicts empirical \ASR{} under held-out completion sampling.
+\end{enumerate}
+
+\section{Background and Motivation}
+\label{sec:background}
+
+\subsection{Attack Success Rate}
+
+Attack success rate measures the fraction of attacks for which a model returns a response judged harmful or compliant with a harmful behavior.  It is the dominant metric in jailbreak benchmarking because it is intuitive and directly tied to observed failures.  HarmBench and JailbreakBench improve the reproducibility of this measurement by specifying behavior sets, threat models, attack templates, and automated grading procedures.
+
+However, \ASR{} is a sampled-output statistic.  It does not characterize the underlying conditional distribution.  This matters whenever the visible response is not representative of the nearby continuation mass.  Greedy decoding can land on a refusal while alternative high-probability branches proceed toward compliance.  Sampling with a small number of trials can miss rare but meaningful branches.  A defense can move the mode of the distribution while leaving harmful branches nearby.  A fixed benchmark template can miss the template family that unlocks the largest harmful mass.
+
+\subsection{Probabilistic Model Checking}
+
+Probabilistic Computation Tree Logic (PCTL) is a temporal logic for reasoning about discrete-time Markov chains \cite{hansson1994logic,baier2008principles}.  The path operator $\mathbf{F}\phi$ means that property $\phi$ eventually holds; $\mathbf{G}\phi$ means that $\phi$ holds globally along the path.  A formula such as $\Prob_{\geq 0.9}[\mathbf{G}\neg \harm]$ states that the probability of never reaching a harmful state is at least $0.9$.
+
+For finite acyclic chains, reachability probabilities can be computed exactly by backward induction.  This is the setting used here.  We do not attempt unbounded verification of the full LLM distribution.  Instead, we construct a bounded continuation tree and compute finite-horizon reachability within that tree.
+
+\subsection{From LLM Generation to a Markov Chain}
+
+An autoregressive model $M$ defines a distribution over tokens:
+\[
+  P_M(t_n \mid x,t_{<n}),
+\]
+where $x$ is the prompt and $t_{<n}$ is the generated prefix.  This naturally induces a Markov chain over prefix states.  The initial state is the prompt; each transition appends one token; transition probabilities are the model's next-token probabilities.
+
+The full chain is infeasible to enumerate because modern vocabularies have tens of thousands of tokens and depth grows exponentially.  We therefore analyze a bounded process that retains only likely branches.  This follows the high-level bounded-tree view of LLMChecker \cite{gross2025llmchecker}, but uses a semantic harm evaluator and focuses on adversarial robustness diagnostics rather than general text-quality properties.
+
+\section{Problem Definition}
+\label{sec:problem}
+
+Let $x$ be a prompt, $M$ an autoregressive language model with vocabulary $\calV$, and $L$ a finite horizon.  A generated continuation of length $L$ is $y = (t_1,\ldots,t_L)$ with probability
+\[
+  P_M(y\mid x)
+  =
+  \prod_{\ell=1}^{L}
+  P_M(t_\ell \mid x,t_{<\ell}).
+\]
+Let $J$ be an evaluator that maps a prompt-continuation pair to a semantic label:
+\[
+  J(x,y) \in \{\harm,\safe\}.
+\]
+Our goal is to estimate, for a fixed prompt and model, the probability that likely continuations reach harmful content within a bounded horizon.
+
+\begin{definition}[Prompt-local harmful mass]
+For a prompt $x$, model $M$, evaluator $J$, and horizon $L$, the unbounded finite-horizon harmful mass is
+\[
+  H_L(x;M,J)
+  =
+  \Prob_{y\sim M(\cdot\mid x)}
+  \left[J(x,y)=\harm\right].
+\]
+\end{definition}
+
+Directly computing $H_L$ requires summing over $|\calV|^L$ continuations.  \BCA{} replaces this quantity with a bounded approximation over a tractable tree.
+
+\begin{definition}[$\alpha$-$k$ bounded active set]
+At a prefix state $s$, let $t_{(1)},t_{(2)},\ldots$ be tokens sorted by decreasing next-token probability $P_M(t\mid s)$.  Given a cumulative threshold $\alpha\in(0,1]$ and a cap $k$, define
+\[
+  m(s)
+  =
+  \min\left(k,\; \min\left\{j : \sum_{i=1}^{j} P_M(t_{(i)}\mid s) \geq \alpha\right\}\right),
+\]
+and
+\[
+  T_{\alpha,k}(s)
+  =
+  \{t_{(1)},\ldots,t_{(m(s))}\}.
+\]
+\end{definition}
+
+The retained outgoing probabilities are renormalized:
+\[
+  \widetilde P(s,s\cdot t)
+  =
+  \frac{P_M(t\mid s)}
+       {\sum_{u\in T_{\alpha,k}(s)}P_M(u\mid s)}
+  \qquad t\in T_{\alpha,k}(s).
+\]
+This gives a finite tree of depth $L$ and branching factor at most $k$.
+
+\begin{definition}[Bounded harmful mass]
+Let $\calT_{\alpha,k,L}(x,M)$ be the $\alpha$-$k$ bounded continuation tree rooted at prompt $x$.  The bounded harmful mass is
+\[
+  H_{\alpha,k,L}(x;M,J)
+  =
+  \Prob_{\widetilde P}
+  \left[\mathbf{F}\,\harm\right],
+\]
+where terminal nodes are labeled by $J$ and path probabilities are computed under the renormalized bounded process.
+\end{definition}
+
+\paragraph{Interpretation.}
+$H_{\alpha,k,L}$ is not the true full-distribution harmful probability.  It is the probability of reaching harm within the retained likely branches, conditional on the bounding rule.  This is precisely the object we use as a diagnostic: \emph{how much harmful mass exists nearby in token space under a stated bounded process?}
+
+\section{Method}
+\label{sec:method}
+
+\subsection{Bounded Continuation Analysis}
+
+\BCA{} proceeds in three stages:
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Tree construction.} Starting from the prompt prefix, expand an $\alpha$-$k$ bounded tree to depth $L$ using the model's next-token distribution at each prefix.
+  \item \textbf{Semantic labeling.} Decode terminal continuations and label them with a semantic harm judge $J$.
+  \item \textbf{Reachability computation.} Compute $\Prob[\mathbf{F}\,\harm]$ by exact backward induction when the bounded tree is small enough, or estimate it by statistical model checking when enumeration is too expensive.
+\end{enumerate}
+
+\begin{algorithm}[t]
+\caption{Exact bounded continuation analysis}
+\label{alg:exact-bca}
+\begin{algorithmic}[1]
+\Require Prompt $x$, model $M$, judge $J$, horizon $L$, threshold $\alpha$, cap $k$
+\State Initialize root state $s_0=x$
+\For{$d=0,\ldots,L-1$}
+  \ForAll{active states $s$ at depth $d$}
+    \State Compute $P_M(\cdot\mid s)$
+    \State Retain $T_{\alpha,k}(s)$ and renormalized transitions $\widetilde P$
+    \State Add children $s\cdot t$ for $t\in T_{\alpha,k}(s)$
+  \EndFor
+\EndFor
+\ForAll{leaves $s$ at depth $L$}
+  \State $\ell(s)\gets J(x,s)$
+  \State $V(s)\gets \ind[\ell(s)=\harm]$
+\EndFor
+\For{$d=L-1,\ldots,0$}
+  \ForAll{states $s$ at depth $d$}
+    \State $V(s)\gets \sum_{t\in T_{\alpha,k}(s)} \widetilde P(s,s\cdot t)V(s\cdot t)$
+  \EndFor
+\EndFor
+\State \Return $V(s_0)$
+\end{algorithmic}
+\end{algorithm}
+
+The exact computation in \cref{alg:exact-bca} is linear in the number of bounded states after expansion.  The expansion itself remains exponential in the worst case, $O(k^L)$, which motivates the statistical estimator below.
+
+\subsection{Semantic Harm Evaluator}
+
+For the main semantic experiments, terminal continuations are judged by a Qwen2.5-7B-Instruct semantic evaluator.  The evaluator receives the harmful behavior and the generated continuation and returns a binary judgment indicating whether the continuation is harmful/compliant with the behavior.  The same semantic judge is used for bounded-mass estimates and empirical \ASR{} validation, preventing judge mismatch in the correlation and budget experiments.
+
+All probabilities are therefore evaluator-conditional.  When we write $\Prob[\mathbf{F}\,\harm]$, the event is ``the semantic judge labels a reached terminal continuation harmful.''  This makes evaluator quality a core limitation rather than a solved subproblem.
+
+\subsection{Reachability Metrics}
+
+The primary metric is bounded harmful reachability:
+\[
+  \Prob[\mathbf{F}\,\harm] = V(s_0).
+\]
+We also use:
+\[
+  \Prob[\mathbf{G}\neg\harm] = 1 - \Prob[\mathbf{F}\,\harm]
+\]
+within the same bounded tree when harm labels are terminal and absorbing.
+
+To study refusal instability, let $R(s_0\cdot t)$ indicate that the first generated segment begins with a refusal marker.  The refusal-collapse probability is
+\[
+  \Prob[\refusal \wedge \mathbf{F}\,\harm]
+  =
+  \sum_{t:\,R(s_0\cdot t)}
+  \widetilde P(s_0,s_0\cdot t)\,V(s_0\cdot t).
+\]
+This isolates paths that begin as refusals but later reach harmful completions.
+
+\subsection{Statistical Model Checking}
+
+When exact enumeration exceeds the state budget, we sample $N$ independent trajectories from the same bounded process.  Each sampled path $\pi_i$ is scored by the property indicator
+\[
+  X_i = \ind[\pi_i \models \mathbf{F}\,\harm].
+\]
+The estimator is
+\[
+  \widehat P[\mathbf{F}\,\harm]
+  =
+  \frac{1}{N}\sum_{i=1}^{N}X_i.
+\]
+By Hoeffding's inequality \cite{hoeffding1963},
+\[
+  \Prob\left(\left|\widehat P - P\right|\geq \varepsilon\right)
+  \leq 2\exp(-2N\varepsilon^2).
+\]
+Equivalently, with probability at least $1-\delta$,
+\[
+  \left|\widehat P-P\right|
+  \leq
+  \sqrt{\frac{\ln(2/\delta)}{2N}}.
+\]
+For $N=200$ and $\delta=0.05$, the half-width is approximately $0.096$; for $N=500$, it is approximately $0.061$.
+
+\section{Experimental Setup}
+\label{sec:setup}
+
+\subsection{Models and Behaviors}
+
+We evaluate four instruction-tuned models:
+
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item Qwen2.5-1.5B-Instruct
+  \item Qwen2.5-7B-Instruct
+  \item Mistral-7B-Instruct-v0.2
+  \item Llama-3.1-8B-Instruct
+\end{itemize}
+
+The behavior set is JailbreakBench's harmful behavior suite, organized into ten broad categories: harassment/discrimination, malware/hacking, physical harm, economic harm, fraud/deception, disinformation, sexual/adult content, privacy, expert advice, and government decision-making.
+
+\subsection{Evaluation Modes}
+
+We separate three measurement modes throughout the paper:
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.44\linewidth}p{0.22\linewidth}}
+\toprule
+\textbf{Mode} & \textbf{Computation} & \textbf{Uncertainty}\\
+\midrule
+Exact bounded \DTMC{} & Enumerate the bounded tree, label leaves, run backward induction. & No Monte Carlo error; bounded by $\alpha,k,L,J$.\\
+\SMC{} estimate & Sample $N$ paths from the bounded process and estimate $\Prob[\varphi]$. & Hoeffding interval; $\varepsilon\approx0.096$ for $N=200,\delta=0.05$.\\
+Empirical \ASR{} & Sample full completions and judge completed responses. & Ordinary sampling noise.\\
+\bottomrule
+\end{tabular}
+\caption{Measurement modes used in the evaluation.}
+\label{tab:modes}
+\end{table}
+
+\subsection{Research Questions}
+
+The evaluation is organized around four questions:
+
+\begin{description}[leftmargin=*,style=nextline,itemsep=3pt]
+  \item[RQ1: Hidden mass.] Does the bounded continuation distribution reveal harmful mass that is invisible to greedy \ASR?
+  \item[RQ2: Model comparison.] Can \BCA{} distinguish models that standard \ASR{} treats as equivalent?
+  \item[RQ3: Search objective.] Is $\Prob[\mathbf{F}\,\harm]$ an effective gradient-free signal for jailbreak-template selection?
+  \item[RQ4: Predictive validity.] Does bounded harmful mass predict empirical attack success, and when does it beat direct sampling under a query budget?
+\end{description}
+
+\section{RQ1: Hidden Harmful Mass}
+\label{sec:rq1}
+
+RQ1 tests the basic premise: if greedy decoding appears safe, can the continuation distribution still contain harmful mass?
+
+\paragraph{Setup.}
+We evaluate Qwen2.5-1.5B-Instruct on 100 JailbreakBench behaviors using exact bounded \DTMC{} model checking.  The setup uses $\alpha=0.90$, $k=5$, $L=10$, chat templates, and GPU sparse backward induction over the bounded tree.  Rows that hit the node budget are reported as conservative truncated estimates.  Greedy \ASR{} is zero for all 100 prompts.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{llrrr}
+\toprule
+\textbf{Prompt} & \textbf{Category} & \textbf{Greedy} & $\mathbf{\Prob[F\,harm]}$ & $\mathbf{\Prob[F\,ref]}$\\
+\midrule
+Regulatory loopholes & government & safe & 0.3363 & 0.4157\\
+Phishing & privacy & safe & 0.0232 & 0.1615\\
+Plagiarism & fraud/deception & safe & 0.0136 & 0.4309\\
+Ageism & harassment & safe & 0.0113 & 0.7576\\
+Ethnic genocide & physical harm & safe & 0.0099 & 0.4841\\
+Holocaust denial & disinformation & safe & 0.0030 & 0.5286\\
+Sept. 11 conspiracy & disinformation & safe & 0.0011 & 0.5009\\
+Ingesting detergent & physical harm & safe & 0.0006 & 0.0778\\
+Emergency mitigation & expert advice & safe & 0.0004 & 0.0000\\
+Payday loans & economic harm & safe & 0.0003 & 0.1414\\
+\bottomrule
+\end{tabular}
+\caption{Top Qwen2.5-1.5B prompts by bounded harmful mass in RQ1.  Greedy \ASR{} is zero for all prompts; the harmful mass column is invisible to one-sample evaluation.}
+\label{tab:rq1-top}
+\end{table}
+
+\paragraph{Finding 1: greedy safety can hide large bounded mass.}
+The strongest case is the regulatory-loopholes prompt.  Greedy decoding refuses, yet the bounded process assigns $0.3363$ probability to harmful leaves.  This is not a rare tail event under the bounded process; it is a large alternative branch mass that ordinary greedy \ASR{} cannot observe.
+
+\paragraph{Finding 2: refusal stability varies by prompt.}
+Thirteen of 100 prompts have $\Prob[\mathbf{F}\,\refusal] < 0.30$, meaning the model does not consistently route to refusal within the bounded horizon.  Examples include emergency mitigation, revenge porn, email scam, and ingesting detergent.  These prompts are greedy-safe but structurally fragile.
+
+\paragraph{Finding 3: tree size acts as a deliberation signal.}
+Soft-harm categories generate much larger trees than hard-harm categories.  Climate disinformation, xenophobia, and vaccine disinformation produce hundreds of thousands of states in the exact expansion, while bomb-making and school-shooting behaviors produce tiny trees because the model commits to refusal in one or two tokens.  Tree size is therefore a useful auxiliary signal: it reflects how quickly the model's local distribution collapses to refusal.
+
+\paragraph{Finding 4: some categories are robustly refused.}
+The malware/hacking category is the clearest robust case for Qwen2.5-1.5B in this setup: all ten prompts have $\Prob[\mathbf{F}\,\harm]=0.0000$ and average $\Prob[\mathbf{F}\,\refusal]=0.8273$.  These are not merely safe sampled outputs; the bounded distribution itself routes strongly to refusal.
+
+\section{RQ2: Model Comparison Under Zero Greedy ASR}
+\label{sec:rq2}
+
+RQ2 asks whether bounded harmful mass distinguishes models that look identical under greedy \ASR.  The cross-model sweep uses SMC estimates with 200 bounded trajectories and a Qwen2.5-7B semantic judge.  Qwen2.5-1.5B is additionally checked using exact bounded \DTMC{} verification with $k=2$, $L=8$, $\alpha=0.99$ on 100 behaviors.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Model} & \textbf{Greedy ASR} & \textbf{Mean best} & \textbf{$\geq0.99$} & \textbf{Resistant}\\
+\midrule
+Qwen2.5-7B-Instruct & 0/95 & 0.933 & 88/95 & 3/95\\
+Mistral-7B-Instruct-v0.2 & 0/95 & 0.895 & 73/95 & 4/95\\
+Qwen2.5-1.5B-Instruct & 0/100 & 0.906 & 72/100 & 2/100\\
+Llama-3.1-8B-Instruct & 0/95 & 0.178 & 2/95 & 37/95\\
+\bottomrule
+\end{tabular}
+\caption{Cross-model safety profile.  All models score greedy \ASR{} $=0$, but bounded harmful mass reveals a wide spread.  Qwen2.5-1.5B figures are exact bounded \DTMC{} values; the other rows are SMC estimates.  ``Resistant'' means no template achieves $\Prob[\harm] > 0.05$.}
+\label{tab:rq2-models}
+\end{table}
+
+\paragraph{Qwen2.5-7B: high susceptibility under commitment templates.}
+Qwen2.5-7B has the highest mean best harmful mass.  Suffix forcing reaches $\Prob[\harm]\geq0.99$ on 88 of 95 behaviors, and only 3 behaviors resist all templates.  This is notable because Qwen2.5-7B shares a model family with Qwen2.5-1.5B but is more susceptible under the template search.
+
+\paragraph{Mistral-7B: high baseline leakage.}
+Mistral shows the highest direct-prompt baseline in the sweep, with average no-template $\Prob[\harm]=0.310$.  Suffix forcing is strong, but output-format injection and fictional framing are also competitive.  This suggests a broader vulnerability surface rather than a single template-specific failure.
+
+\paragraph{Qwen2.5-1.5B: robust by default, brittle under commitment.}
+Direct prompts have low harmful mass on average, and some categories are strongly refused.  Under suffix forcing, however, the exact bounded tree often collapses to a few near-deterministic harmful leaves.  Exact verification finds 72 of 100 behaviors with $\Prob[\harm]\geq0.99$ and only two behaviors that fully resist all 18 templates.
+
+\paragraph{Llama-3.1-8B: qualitatively more robust.}
+Llama has the lowest mean best harmful mass, only two behaviors with $\Prob[\harm]\geq0.99$, and 37 of 95 behaviors that resist every template.  Its strongest template family is nested fiction rather than suffix forcing, indicating a different vulnerability surface.
+
+\paragraph{Conclusion for RQ2.}
+Greedy \ASR{} treats all four models as identical: 0 successful greedy attacks.  \BCA{} reveals a roughly $5\times$ spread in mean best harmful mass and a large difference in fully resistant behavior counts.  This is the core model-comparison value of the method.
+
+\section{RQ3: Harmful Mass as a Template-Search Signal}
+\label{sec:rq3}
+
+Jailbreak templates are a free variable: the same harmful goal wrapped in different phrasings can produce identical greedy \ASR{} but very different bounded harmful mass.  RQ3 asks whether $\Prob[\mathbf{F}\,\harm]$ is useful for ranking templates before spending empirical red-team queries.
+
+\subsection{Template Families}
+
+We evaluate 18 templates spanning six strategy classes:
+
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Baseline:} direct prompt.
+  \item \textbf{Narrative:} fictional framing, bedtime-story framing, nested fiction.
+  \item \textbf{Encyclopedic:} Wikipedia-style or historical/documentary framing.
+  \item \textbf{Persona:} named unconstrained assistant or professional role framing.
+  \item \textbf{Prefix/suffix commitment:} forced completion, suffix forcing, output-format injection.
+  \item \textbf{Permission/override:} educational, hypothetical, refusal-bypass, DAN-style framing.
+\end{itemize}
+
+We describe template families rather than printing operational jailbreak text; the point is the relative ranking of strategy classes, not dissemination of prompts.
+
+\subsection{Qwen2.5-1.5B Template Search}
+
+On a 14-behavior Qwen2.5-1.5B subset with 18 templates and 200 SMC trajectories per behavior-template pair, suffix forcing wins 13 of 14 behaviors at $\Prob[\mathbf{F}\,\harm]=1.0$.  Wikipedia-style framing wins the remaining behavior.  DAN-style and permission-class templates win zero.
+
+The mechanism is interpretable.  Permission and override templates often explicitly mention safety rules, which can activate refusal behavior.  Suffix forcing instead frames generation as an unconditional continuation, shifting the model toward commitment before the refusal path is selected.  Output-format injection is also strong, suggesting that safety training may cover conversational refusal more thoroughly than structured technical response formats.
+
+\subsection{Cross-Model Template Generalization}
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Model} & \textbf{Suffix wins} & \textbf{$\geq0.99$} & \textbf{Mean best} & \textbf{No template}\\
+\midrule
+Qwen2.5-7B & 84/95 & 88/95 & 0.933 & 3\\
+Mistral-7B & 42/95 & 73/95 & 0.895 & 4\\
+Qwen2.5-1.5B & 9/10 & 8/10 & 0.974 & 0\\
+Llama-3.1-8B & 18/95 & 2/95 & 0.178 & 37\\
+\bottomrule
+\end{tabular}
+\caption{Template generalization across model families using SMC estimates.  Suffix forcing is broadly strong, but penetration depth varies sharply.}
+\label{tab:rq3-template-generalization}
+\end{table}
+
+Suffix forcing ranks first on all four model families, but its penetration depth varies substantially.  It wins 84/95 behaviors on Qwen2.5-7B but only 18/95 on Llama-3.1-8B.  Llama's strongest family is nested fiction, suggesting that its safety training guards better against direct commitment patterns while remaining more permeable to narrative framing.
+
+\subsection{Exact Bounded DTMC Confirmation}
+
+To remove sampling noise from the strongest Qwen2.5-1.5B claim, we run exact bounded \DTMC{} verification with $k=2$, $L=8$, $\alpha=0.99$ and semantic leaf labeling.  Suffix forcing wins 76/100 behaviors; output-format injection wins 15.  Exact $\Prob[\harm]\geq0.99$ holds on 72/100 behaviors, and only two behaviors fully resist all 18 templates.  Under suffix forcing, the bounded trees often collapse to 1--8 leaves, all judged harmful.
+
+\section{RQ4: Predictive Validity and Query Budget}
+\label{sec:rq4}
+
+RQ4 evaluates whether bounded harmful mass tracks real completions.  We estimate $\Prob[\mathbf{F}\,\harm]$ for each behavior-template pair using SMC, then independently sample 100 full completions and judge them with the same semantic evaluator.
+
+\paragraph{Correlation.}
+Across 100 behavior-template pairs, the rank correlation between bounded mass and empirical semantic \ASR{} is
+\[
+  \rho_{\mathrm{Spearman}} = 0.6631,
+  \qquad p = 5.6\times10^{-14}.
+\]
+This is strong evidence that bounded harmful mass is a useful ranking signal.  The correlation is not perfect for an expected reason: bounded mass scores the first $L$ tokens, while empirical \ASR{} scores full completions.  Some continuations begin on harmful-looking trajectories and later hedge or refuse.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Behavior} & \textbf{Direct} & \textbf{Random} & \textbf{Top-1 Mass} & \textbf{Lift}\\
+\midrule
+Ableism & 0.000 & 0.114 & 0.530 & 4.65$\times$\\
+Racial discrimination & 0.000 & 0.033 & 0.180 & 5.45$\times$\\
+Sex discrimination & 0.000 & 0.026 & 0.150 & 5.77$\times$\\
+Password cracking & 0.000 & 0.012 & 0.110 & 9.17$\times$\\
+Network hacking & 0.000 & 0.011 & 0.100 & 9.09$\times$\\
+Holocaust glorification & 0.000 & 0.013 & 0.110 & 8.46$\times$\\
+Sexism & 0.000 & 0.007 & 0.030 & 4.29$\times$\\
+Xenophobia & 0.000 & 0.012 & 0.030 & 2.50$\times$\\
+\midrule
+Mean & 0.000 & 0.027 & 0.155 & 6.17$\times$\\
+\bottomrule
+\end{tabular}
+\caption{Mass-guided template selection improves empirical \ASR{} over random selection on behaviors where lift is defined.}
+\label{tab:rq4-lift}
+\end{table}
+
+\paragraph{Top-$k$ coverage.}
+Selecting the top template by bounded mass includes at least one successful empirical attack for 8/11 behaviors.  The top three templates cover 9/11, and the top five cover 10/11.  Thus bounded mass is useful not only for selecting a single template but also for triaging a small candidate set.
+
+\paragraph{Budget crossover.}
+We simulate empirical search under a query budget.  For each budget level $B$, empirical search spends $B$ queries per template, ranks templates by observed success, chooses a winner, and evaluates that winner on held-out samples.  \BCA-guided selection uses the SMC $\Prob[\mathbf{F}\,\harm]$ ranking with zero empirical search samples.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{rrrrr}
+\toprule
+$B$ & \textbf{Queries} & \textbf{Random ASR} & \textbf{Empirical ASR} & \textbf{BCA ASR}\\
+\midrule
+1 & 10 & 0.025 & 0.041 & 0.113\\
+2 & 20 & 0.025 & 0.060 & 0.113\\
+5 & 50 & 0.026 & 0.089 & 0.113\\
+10 & 100 & 0.026 & 0.110 & 0.113\\
+25 & 250 & 0.025 & 0.126 & 0.113\\
+50 & 500 & 0.025 & 0.131 & 0.113\\
+\bottomrule
+\end{tabular}
+\caption{Budget simulation.  \BCA-guided selection outperforms empirical search until approximately 100 empirical search queries per behavior.}
+\label{tab:budget}
+\end{table}
+
+The crossover occurs near $B=10$, or 100 total search queries per behavior.  Below that threshold, empirical estimates are too noisy to identify the best template reliably.  Above it, empirical search can correct for the depth-$L$ gap and marginally surpass bounded-mass selection.
+
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{What BCA Adds to ASR}
+
+\ASR{} answers whether an observed response was harmful.  \BCA{} answers a different question: how much harmful probability mass exists in the bounded continuation neighborhood?  These questions are complementary.  \ASR{} is the right metric for realized failures; \BCA{} is a diagnostic for hidden instability.
+
+The most important use cases are:
+
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Prompt triage.} Identify prompts that look safe under greedy decoding but have nontrivial harmful mass.
+  \item \textbf{Model comparison.} Separate models that have identical sampled \ASR{} but different distributional robustness.
+  \item \textbf{Defense evaluation.} Detect defenses that move the greedy path without reducing harmful mass.
+  \item \textbf{Search guidance.} Rank jailbreak templates before spending empirical queries.
+  \item \textbf{Patch validation.} Check whether a mitigation actually removes harmful branches from the bounded process.
+\end{itemize}
+
+\subsection{Why Semantic Evaluation Matters}
+
+Keyword matching is insufficient for this setting.  Harmful content can be phrased indirectly; refusals can begin safely and collapse into compliance; and template search can alter surface form without changing semantic risk.  The semantic judge is therefore central to the method.  It also introduces a bottleneck: all reported probabilities are conditional on the judge's accuracy, calibration, and policy boundary.
+
+\subsection{Exact vs. SMC Results}
+
+Exact bounded \DTMC{} checking is strongest when feasible: it has no Monte Carlo error and gives the exact reachability probability for the bounded tree.  But exact enumeration is exponential in $k$ and $L$.  SMC is the practical mode for larger model and template sweeps.  The paper therefore treats exact and SMC results separately: exact results are used for Qwen2.5-1.5B confirmation runs, while broader cross-model comparisons use SMC estimates with stated confidence intervals.
+
+\section{Limitations}
+\label{sec:limitations}
+
+\paragraph{Not a proof of safety.}
+\BCA{} does not certify the full unbounded output distribution.  It estimates bounded harmful mass for a specific prompt, model, decoding process, horizon, bounding rule, and evaluator.
+
+\paragraph{Bounding discards tail mass.}
+Top-$k$ and $\alpha$ truncation ignore low-probability branches.  For rare catastrophic events, adversarial tail search may be more appropriate than high-probability bounded expansion.
+
+\paragraph{Tree expansion is exponential.}
+Even with GPU batching and sparse backward induction, exact enumeration grows as $O(k^L)$.  Larger horizons require SMC, adaptive expansion, or property-directed search.
+
+\paragraph{Evaluator quality is central.}
+If the semantic harm judge is weak, biased, or inconsistent, the probability estimate inherits those errors.  Future work should evaluate judge sensitivity and use ensembles or human-audited calibration sets.
+
+\paragraph{Depth-$L$ gap.}
+Bounded prefixes can look harmful but later hedge, or look safe but later become harmful.  This explains part of the gap between bounded mass and empirical full-completion \ASR.
+
+\paragraph{Template coverage.}
+The template set is broad but not exhaustive.  A different adversary may discover templates not represented here.
+
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Jailbreak benchmarks.}
+HarmBench and JailbreakBench provide standardized harmful behavior sets and automated evaluation procedures for red-teaming LLMs.  \BCA{} builds on this benchmarking view but changes the measured object from sampled outcomes to bounded distributional mass.
+
+\paragraph{Attack success-rate validity.}
+Recent work argues that attack success-rate comparisons can be measurement-invalid when threat models, judges, sampling budgets, and attack costs differ \cite{chouldechova2026measurement}.  \BCA{} does not replace valid \ASR{} measurement; it adds a complementary distributional diagnostic that can be reported under explicit bounding and evaluator assumptions.
+
+\paragraph{Probabilistic model checking for LLMs.}
+LLMChecker formalizes LLM generation as a bounded \DTMC{} and evaluates PCTL properties over generated text \cite{gross2025llmchecker}.  Our work applies the same broad formal-methods perspective to jailbreak evaluation, introduces semantic harmful-reachability metrics, and evaluates whether bounded mass predicts empirical attack success.
+
+\paragraph{Statistical model checking.}
+SMC has long been used to estimate probabilistic temporal properties when exact model checking is infeasible \cite{younes2002probabilistic,legay2010statistical}.  Here, each sampled bounded continuation is a path through an LLM-induced stochastic process, and the property indicator is provided by a semantic harm judge.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+Attack success rate asks whether a sampled response is harmful.  That is necessary, but incomplete.  Bounded continuation analysis asks how much harmful probability mass exists nearby in the model's conditional output distribution.  Across JailbreakBench behaviors and four instruction-tuned models, this diagnostic reveals hidden harmful mass under greedy-safe outputs, separates models with identical greedy \ASR, identifies template families that unlock harmful mass, and predicts empirical attack success under query constraints.
+
+The central takeaway is not that \BCA{} proves safety.  It does not.  The takeaway is that local distributional structure matters.  A refusal supported by nearly all likely continuations is different from a refusal that is merely the greedy path.  \BCA{} makes that difference measurable.
+
+\appendix
+
+\section{Implementation Notes}
+\label{app:implementation}
+
+The implementation uses breadth-first expansion so all active prefixes at a given depth can be processed in batched model calls.  Exact verification stores the bounded tree and performs reverse-depth value propagation.  Semantic \DTMC{} mode labels terminal leaves with the Qwen2.5-7B semantic judge and then computes exact $\Prob[\mathbf{F}\,\harm]$.  SMC mode samples bounded trajectories and applies the same judge to sampled terminal continuations.
+
+The exact all-model run used for follow-up analysis keeps the Qwen2.5-7B judge loaded once while switching generator models sequentially.  This avoids reloading the judge for each model and ensures that cross-model exact runs share the same semantic evaluator.  Partial exact cross-model results are intentionally not reported in the main paper until all models finish.
+
+\section{Metric Summary}
+\label{app:metrics}
+
+\begin{description}[leftmargin=*,style=nextline]
+  \item[$\Prob[\mathbf{F}\,\harm]$] Probability that the bounded process eventually reaches a judge-labeled harmful terminal continuation.
+  \item[$\Prob[\mathbf{G}\neg\harm]$] Probability that the bounded process stays safe over the horizon.
+  \item[$\Prob[\refusal\wedge\mathbf{F}\,\harm]$] Probability that a continuation begins with a refusal marker and nevertheless reaches harm.
+  \item[Greedy \ASR] Binary outcome indicating whether the argmax/greedy completion is judged harmful.
+  \item[Empirical \ASR] Fraction of sampled full completions judged harmful.
+\end{description}
+
+\begin{thebibliography}{99}
+
+\bibitem{baier2008principles}
+Christel Baier and Joost-Pieter Katoen.
+\newblock \emph{Principles of Model Checking}.
+\newblock MIT Press, 2008.
+
+\bibitem{chouldechova2026measurement}
+Alex Chouldechova, A. Feder Cooper, Solon Barocas, Abhinav Palia, Dan Vann, and Hanna Wallach.
+\newblock Comparison requires valid measurement: Rethinking attack success rate comparisons in AI red teaming.
+\newblock \emph{Advances in Neural Information Processing Systems}, 38, 2026.
+
+\bibitem{gross2025llmchecker}
+David Gross, Helge Spieker, and Arnaud Gotlieb.
+\newblock Bounded PCTL model checking of large language model outputs.
+\newblock arXiv preprint, 2025.
+
+\bibitem{hansson1994logic}
+Hans Hansson and Bengt Jonsson.
+\newblock A logic for reasoning about time and reliability.
+\newblock \emph{Formal Aspects of Computing}, 6(5):512--535, 1994.
+
+\bibitem{hoeffding1963}
+Wassily Hoeffding.
+\newblock Probability inequalities for sums of bounded random variables.
+\newblock \emph{Journal of the American Statistical Association}, 58(301):13--30, 1963.
+
+\bibitem{legay2010statistical}
+Axel Legay, Beno\^{i}t Delahaye, and Saddek Bensalem.
+\newblock Statistical model checking: An overview.
+\newblock In \emph{Runtime Verification}, 2010.
+
+\bibitem{mazeika2024harmbench}
+Mantas Mazeika et al.
+\newblock HarmBench: A standardized evaluation framework for automated red teaming and robust refusal.
+\newblock 2024.
+
+\bibitem{chao2024jailbreakbench}
+Patrick Chao et al.
+\newblock JailbreakBench: An open robustness benchmark for jailbreaking large language models.
+\newblock 2024.
+
+\bibitem{younes2002probabilistic}
+H{\'a}lim L. S. Younes and Reid G. Simmons.
+\newblock Probabilistic verification of discrete event systems using acceptance sampling.
+\newblock In \emph{Computer Aided Verification}, 2002.
+
+\end{thebibliography}
+
+\end{document}

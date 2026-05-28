@@ -48,7 +48,10 @@ def build_dtmc_bfs(
     quantification_fn: Callable[[str, int], Dict[str, int]],
     llm_backend: Any,
     temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k_sampling: int = -1,
     verbose: bool = True,
+    max_active_nodes: int = 50_000,
 ) -> Tuple[List[List[DTMCNode]], Dict[str, float]]:
     """
     Build the α-k-bounded LLM text generation DTMC via BFS.
@@ -61,7 +64,9 @@ def build_dtmc_bfs(
     k                : hard cap on branching factor per node
     quantification_fn: callable(text, depth) → Dict[str, int]
     llm_backend      : VLLMBackend or HFBackend instance
-    temperature      : LLM temperature (1.0 = unmodified distribution)
+    temperature      : LLM sampling temperature (1.0 = unmodified distribution)
+    top_p            : nucleus sampling threshold (1.0 = disabled)
+    top_k_sampling   : hard cap on sampling distribution (-1 = disabled)
     verbose          : show tqdm progress bar per level
 
     Returns
@@ -118,10 +123,23 @@ def build_dtmc_bfs(
         if not active:
             break
 
+        if len(active) > max_active_nodes:
+            stats["budget_truncated"] = True
+            stats["truncated_at_depth"] = depth
+            # Treat all remaining active nodes as absorbing — backward
+            # induction will assign them value 0 (neither harm nor refusal
+            # confirmed), which is conservative: we underestimate, not overestimate.
+            break
+
         # ── Single batched LLM call for the entire level ──────────────────
         strings = [node.string for node in active]
         top_k_results = llm_backend.get_top_k_batch(
-            strings, alpha=alpha, k=k, temperature=temperature
+            strings,
+            alpha=alpha,
+            k=k,
+            temperature=temperature,
+            top_p=top_p,
+            top_k_sampling=top_k_sampling,
         )
 
         next_level: List[DTMCNode] = []

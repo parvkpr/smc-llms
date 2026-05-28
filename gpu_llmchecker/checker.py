@@ -98,7 +98,9 @@ class LLMCheckerGPU:
     use_smc         : if True, use statistical MC instead of exact verification
     smc_samples     : number of samples for SMC
     smc_confidence  : confidence level for Chernoff bounds
-    temperature     : LLM temperature (1.0 = unmodified distribution)
+    temperature     : LLM sampling temperature (1.0 = unmodified distribution)
+    top_p           : nucleus sampling threshold; 1.0 disables nucleus filtering
+    top_k_sampling  : hard top-k cap on the sampling distribution; -1 disables
     """
 
     def __init__(
@@ -110,6 +112,8 @@ class LLMCheckerGPU:
         smc_samples: int = 2000,
         smc_confidence: float = 0.95,
         temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k_sampling: int = -1,
     ) -> None:
         self.backend = llm_backend
         self.quantifier = quantifier
@@ -118,6 +122,8 @@ class LLMCheckerGPU:
         self.smc_samples = smc_samples
         self.smc_confidence = smc_confidence
         self.temperature = temperature
+        self.top_p = top_p
+        self.top_k_sampling = top_k_sampling
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -148,6 +154,8 @@ class LLMCheckerGPU:
             quantification_fn=quant_fn,
             llm_backend=self.backend,
             temperature=self.temperature,
+            top_p=self.top_p,
+            top_k_sampling=self.top_k_sampling,
             verbose=verbose,
         )
 
