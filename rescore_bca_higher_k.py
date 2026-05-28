@@ -419,18 +419,15 @@ def main() -> None:
             model_id=args.judge_model,
         )
 
-        def judge_fn(texts: List[str]) -> List[int]:
-            scores_int10 = judge.score_responses_int10(texts)
-            return [100 if s >= 10 else 0 for s in scores_int10]
-
         t_start = time.perf_counter()
         for idx, (lid, behavior, prompt, _node) in enumerate(pairs):
             tl = time.perf_counter()
             try:
                 prob, stats = compute_bca_for_prompt(
                     prompt,
+                    behavior,
                     target_backend=target_backend,
-                    judge_fn=judge_fn,
+                    judge_instance=judge,
                     L=new_L,
                     alpha=args.alpha,
                     k=args.new_k,
