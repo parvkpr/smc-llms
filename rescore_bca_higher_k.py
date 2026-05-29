@@ -371,18 +371,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target-device", default="cuda:0")
     p.add_argument("--judge-device", default="cuda:1")
     p.add_argument("--target-backend", default="hf", choices=["hf", "vllm"],
-                   help="Inference backend for the BCA tree-build target model. "
-                        "vllm uses prefix caching + PagedAttention and is 3-5x faster "
-                        "on BCA workloads, but allocates GPU memory greedily.")
-    p.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.55,
-                   help="Fraction of target-device VRAM for vLLM KV cache. "
-                        "Keep <0.6 so the judge can co-exist on the same GPU if needed.")
+                   help="Inference backend for the BCA tree-build target model.")
+    p.add_argument("--judge-backend", default="hf", choices=["hf", "vllm"],
+                   help="Inference backend for the leaf-labeling judge. "
+                        "vllm-qwen-legacy is byte-equivalent to qwen-legacy on outputs "
+                        "but ~5x faster via continuous batching and PagedAttention.")
+    p.add_argument("--vllm-target-gpu-memory-utilization", type=float, default=0.80,
+                   help="vLLM target KV-cache memory fraction.")
+    p.add_argument("--vllm-judge-gpu-memory-utilization", type=float, default=0.80,
+                   help="vLLM judge KV-cache memory fraction.")
     p.add_argument("--vllm-max-logprobs", type=int, default=8,
-                   help="Cap on logprobs vLLM returns per token (must be >= --new-k).")
+                   help="Cap on logprobs vLLM target returns per token (must be >= --new-k).")
     p.add_argument("--vllm-max-model-len", type=int, default=1024,
-                   help="Hard cap on vLLM's max sequence length. Llama-3.1 defaults "
-                        "to 131k which forces huge KV-cache pre-allocation; we only "
-                        "need prompt (~200 tok) + horizon (~12-24 tok), so 1024 is plenty.")
+                   help="Hard cap on vLLM target's max sequence length.")
+    p.add_argument("--vllm-judge-max-model-len", type=int, default=2048,
+                   help="Hard cap on vLLM judge's max sequence length "
+                        "(needs to fit behavior + response + system + chat-template).")
     p.add_argument("--limit-leaves", type=int, default=None,
                    help="If set, only re-score the first N unique leaves (smoke testing).")
     p.add_argument("--skip-rescore", action="store_true",
@@ -427,46 +431,71 @@ def main() -> None:
             print(f"[rescore] skip-rescore set but {out_path} doesn't exist; nothing to reuse", flush=True)
     else:
         repo = _import_repo()
+        import os
+
+        def _dev_idx(s: str) -> str:
+            return s.split(":")[-1] if ":" in s else s
+
+        target_idx = _dev_idx(args.target_device)
+        judge_idx = _dev_idx(args.judge_device)
+        prev_cuda = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+
+        # ── Target backend ────────────────────────────────────────────────
         if args.target_backend == "vllm":
             if repo["VLLMBackend"] is None:
                 raise RuntimeError(
-                    "Requested --target-backend vllm but vLLM failed to import. "
-                    "Install vllm or use --target-backend hf."
+                    "Requested --target-backend vllm but vLLM failed to import."
                 )
-            # vLLM picks devices via CUDA_VISIBLE_DEVICES; we set it explicitly
-            # so that the judge keeps its own device.
-            import os
-            target_dev_idx = args.target_device.split(":")[-1] if ":" in args.target_device else args.target_device
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(target_dev_idx) + "," + (
-                args.judge_device.split(":")[-1] if ":" in args.judge_device else args.judge_device
-            )
-            print(f"[rescore] target backend: vLLM on physical device {target_dev_idx} "
-                  f"(CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']})", flush=True)
+            # Restrict the target engine subprocess to exactly its device.
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(target_idx)
+            print(f"[rescore] target: vLLM on physical cuda:{target_idx} "
+                  f"(CUDA_VISIBLE_DEVICES={target_idx})", flush=True)
             target_backend = repo["VLLMBackend"](
                 args.target_model,
                 max_logprobs=args.vllm_max_logprobs,
-                gpu_memory_utilisation=args.vllm_gpu_memory_utilization,
+                gpu_memory_utilisation=args.vllm_target_gpu_memory_utilization,
                 tensor_parallel_size=1,
                 dtype="auto",
                 enable_prefix_caching=True,
                 max_model_len=args.vllm_max_model_len,
             )
-            # After CUDA_VISIBLE_DEVICES remap, device 0 in PyTorch == target_dev_idx
-            # and device 1 == judge_dev_idx. Re-anchor the judge device for the judge.
-            judge_dev_remap = "cuda:1"
         else:
-            print(f"[rescore] target backend: HFBackend on {args.target_device}", flush=True)
+            print(f"[rescore] target: HFBackend on {args.target_device}", flush=True)
             target_backend = repo["HFBackend"](
                 args.target_model,
                 device=args.target_device,
                 batch_size=args.target_batch_size,
             )
-            judge_dev_remap = args.judge_device
-        judge = repo["build_judge"](
-            args.judge_type,
-            device=judge_dev_remap,
-            model_id=args.judge_model,
-        )
+
+        # ── Judge backend ─────────────────────────────────────────────────
+        if args.judge_backend == "vllm":
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(judge_idx)
+            print(f"[rescore] judge: vLLM on physical cuda:{judge_idx} "
+                  f"(CUDA_VISIBLE_DEVICES={judge_idx})", flush=True)
+            from judges import VLLMQwenLegacyJudge  # noqa: WPS433
+            judge = VLLMQwenLegacyJudge(
+                device=f"cuda:0",  # remapped via CUDA_VISIBLE_DEVICES
+                model_id=args.judge_model,
+                vllm_kwargs=dict(
+                    gpu_memory_utilization=args.vllm_judge_gpu_memory_utilization,
+                    max_model_len=args.vllm_judge_max_model_len,
+                    enforce_eager=True,
+                ),
+            )
+            judge.load()
+        else:
+            print(f"[rescore] judge: HFBackend on {args.judge_device}", flush=True)
+            judge = repo["build_judge"](
+                args.judge_type,
+                device=args.judge_device,
+                model_id=args.judge_model,
+            )
+
+        # Restore env so anything else in this process behaves normally.
+        if prev_cuda is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda
 
         t_start = time.perf_counter()
         for idx, (lid, behavior, prompt, _node) in enumerate(pairs):
