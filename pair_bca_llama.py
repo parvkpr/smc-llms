@@ -486,7 +486,10 @@ def run(args: argparse.Namespace) -> None:
             zip(attacks, prompts, responses, regular_scores),
             start=1,
         ):
-            should_compute_bca = args.objective in ("bca", "hybrid")
+            regular_rich = getattr(args, "regular_bca_feedback", "none") == "rich"
+            should_compute_bca = args.objective in ("bca", "hybrid") or (
+                args.objective == "regular" and regular_rich
+            )
             if should_compute_bca:
                 bca_probability, bca_stats = bca_score_prompt(
                     args.goal,
@@ -516,12 +519,16 @@ def run(args: argparse.Namespace) -> None:
             )
             records.append(record)
 
-            if args.objective == "regular":
+            if args.objective == "regular" and not regular_rich:
                 feedback = regular_iterative_feedback(
                     args.goal, response, score_1_to_10
                 )
             else:
-                rich = getattr(args, "bca_feedback", "minimal") == "rich"
+                rich = (
+                    regular_rich
+                    if args.objective == "regular"
+                    else getattr(args, "bca_feedback", "minimal") == "rich"
+                )
                 feedback = iterative_feedback(
                     args.goal,
                     response,
@@ -599,6 +606,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--judge-device", default="cuda:1")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--early-stop", type=float, default=0.95)
+    parser.add_argument(
+        "--regular-bca-feedback",
+        choices=["none", "rich"],
+        default="none",
+        help="Attacker feedback for regular objective: none or rich (BCA stats in feedback).",
+    )
     parser.add_argument(
         "--bca-feedback",
         choices=["minimal", "rich"],

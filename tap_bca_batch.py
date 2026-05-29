@@ -224,7 +224,10 @@ def run_tap_one(
             pending, prompts, responses, regular_scores
         ):
             query_count += 1
-            should_compute_bca = method in ("bca", "hybrid")
+            regular_rich = getattr(args, "regular_bca_feedback", "none") == "rich"
+            should_compute_bca = method in ("bca", "hybrid") or (
+                method == "regular" and regular_rich
+            )
             if should_compute_bca:
                 bca_probability, bca_stats = bca_score_prompt(
                     goal,
@@ -262,22 +265,30 @@ def run_tap_one(
             records.append(node)
             depth_nodes.append(node)
 
+            if method == "regular" and not regular_rich:
+                feedback_content = regular_iterative_feedback(
+                    goal, response, score_1_to_10
+                )
+            else:
+                rich = (
+                    regular_rich
+                    if method == "regular"
+                    else getattr(args, "bca_feedback", "minimal") == "rich"
+                )
+                feedback_content = iterative_feedback(
+                    goal,
+                    response,
+                    regular_score,
+                    bca_probability,
+                    score_1_to_10,
+                    bca_stats,
+                    rich=rich,
+                )
+
             child_conv.append(
                 {
                     "role": "user",
-                    "content": (
-                        regular_iterative_feedback(goal, response, score_1_to_10)
-                        if method == "regular"
-                        else iterative_feedback(
-                            goal,
-                            response,
-                            regular_score,
-                            bca_probability,
-                            score_1_to_10,
-                            bca_stats,
-                            rich=getattr(args, "bca_feedback", "minimal") == "rich",
-                        )
-                    ),
+                    "content": feedback_content,
                 }
             )
             child_conv = child_conv[-2 * args.keep_last_n :]
@@ -533,6 +544,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--judge-device", default="cuda:1")
     p.add_argument("--device", default="cuda")
     p.add_argument("--redact-responses", action="store_true")
+    p.add_argument(
+        "--regular-bca-feedback",
+        choices=["none", "rich"],
+        default="none",
+        help="Attacker feedback for regular: none (judge-only) or rich "
+        "(compute BCA for feedback only; pruning still uses judge score).",
+    )
     p.add_argument(
         "--bca-feedback",
         choices=["minimal", "rich"],
