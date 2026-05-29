@@ -73,8 +73,14 @@ def _import_repo():
     from gpu_llmchecker import build_dtmc_bfs, exact_backward_induction_semantic  # noqa: WPS433
     from gpu_llmchecker.pctl import eventually  # noqa: WPS433
     from judges import build_judge  # noqa: WPS433
+    # vLLM is optional — only imported if --backend vllm is requested.
+    try:
+        from gpu_llmchecker.backends import VLLMBackend  # noqa: WPS433
+    except Exception:
+        VLLMBackend = None  # type: ignore
     return {
         "HFBackend": HFBackend,
+        "VLLMBackend": VLLMBackend,
         "build_dtmc_bfs": build_dtmc_bfs,
         "exact_backward_induction_semantic": exact_backward_induction_semantic,
         "eventually": eventually,
@@ -364,6 +370,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--judge-batch-size", type=int, default=32)
     p.add_argument("--target-device", default="cuda:0")
     p.add_argument("--judge-device", default="cuda:1")
+    p.add_argument("--target-backend", default="hf", choices=["hf", "vllm"],
+                   help="Inference backend for the BCA tree-build target model. "
+                        "vllm uses prefix caching + PagedAttention and is 3-5x faster "
+                        "on BCA workloads, but allocates GPU memory greedily.")
+    p.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.55,
+                   help="Fraction of target-device VRAM for vLLM KV cache. "
+                        "Keep <0.6 so the judge can co-exist on the same GPU if needed.")
+    p.add_argument("--vllm-max-logprobs", type=int, default=8,
+                   help="Cap on logprobs vLLM returns per token (must be >= --new-k).")
+    p.add_argument("--vllm-max-model-len", type=int, default=1024,
+                   help="Hard cap on vLLM's max sequence length. Llama-3.1 defaults "
+                        "to 131k which forces huge KV-cache pre-allocation; we only "
+                        "need prompt (~200 tok) + horizon (~12-24 tok), so 1024 is plenty.")
     p.add_argument("--limit-leaves", type=int, default=None,
                    help="If set, only re-score the first N unique leaves (smoke testing).")
     p.add_argument("--skip-rescore", action="store_true",
@@ -408,14 +427,44 @@ def main() -> None:
             print(f"[rescore] skip-rescore set but {out_path} doesn't exist; nothing to reuse", flush=True)
     else:
         repo = _import_repo()
-        target_backend = repo["HFBackend"](
-            args.target_model,
-            device=args.target_device,
-            batch_size=args.target_batch_size,
-        )
+        if args.target_backend == "vllm":
+            if repo["VLLMBackend"] is None:
+                raise RuntimeError(
+                    "Requested --target-backend vllm but vLLM failed to import. "
+                    "Install vllm or use --target-backend hf."
+                )
+            # vLLM picks devices via CUDA_VISIBLE_DEVICES; we set it explicitly
+            # so that the judge keeps its own device.
+            import os
+            target_dev_idx = args.target_device.split(":")[-1] if ":" in args.target_device else args.target_device
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(target_dev_idx) + "," + (
+                args.judge_device.split(":")[-1] if ":" in args.judge_device else args.judge_device
+            )
+            print(f"[rescore] target backend: vLLM on physical device {target_dev_idx} "
+                  f"(CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']})", flush=True)
+            target_backend = repo["VLLMBackend"](
+                args.target_model,
+                max_logprobs=args.vllm_max_logprobs,
+                gpu_memory_utilisation=args.vllm_gpu_memory_utilization,
+                tensor_parallel_size=1,
+                dtype="auto",
+                enable_prefix_caching=True,
+                max_model_len=args.vllm_max_model_len,
+            )
+            # After CUDA_VISIBLE_DEVICES remap, device 0 in PyTorch == target_dev_idx
+            # and device 1 == judge_dev_idx. Re-anchor the judge device for the judge.
+            judge_dev_remap = "cuda:1"
+        else:
+            print(f"[rescore] target backend: HFBackend on {args.target_device}", flush=True)
+            target_backend = repo["HFBackend"](
+                args.target_model,
+                device=args.target_device,
+                batch_size=args.target_batch_size,
+            )
+            judge_dev_remap = args.judge_device
         judge = repo["build_judge"](
             args.judge_type,
-            device=args.judge_device,
+            device=judge_dev_remap,
             model_id=args.judge_model,
         )
 
