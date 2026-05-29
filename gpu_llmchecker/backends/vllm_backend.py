@@ -185,3 +185,34 @@ class VLLMBackend:
                 break
 
         return tokens, probs
+
+    @property
+    def tokenizer(self):
+        """Chat-template tokenizer (for BCA initial-string rendering)."""
+        return self.llm.get_tokenizer()
+
+    @property
+    def device(self) -> str:
+        return "cuda:0"
+
+    def generate_chat_batch(
+        self,
+        conversations: List[List[Dict[str, str]]],
+        *,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+    ) -> List[str]:
+        """Multi-token chat completion for TAP/PAIR attack and target queries."""
+        from pair_bca_llama import chat_prompt  # noqa: WPS433 — shared template helper
+
+        prompts = [chat_prompt(self.tokenizer, conv) for conv in conversations]
+        do_sample = temperature > 0
+        sp = SamplingParams(
+            n=1,
+            max_tokens=max_new_tokens,
+            temperature=temperature if do_sample else 0.0,
+            top_p=top_p if do_sample else 1.0,
+        )
+        outputs = self.llm.generate(prompts, sp, use_tqdm=False)
+        return [o.outputs[0].text.strip() for o in outputs]
