@@ -2129,11 +2129,20 @@ Temporal properties:
               <td style="text-align:right;">71.4% (20/28)</td>
               <td style="text-align:right;">75.0% (18/24)</td>
               <td style="text-align:right; color:#15803d; font-weight:700;">+21.2 pp</td></tr>
-          <tr><td style="padding:0.4em 0.7em;">multi-seed Qwen-pruning, seeds 44–46</td>
+          <tr><td style="padding:0.4em 0.7em;">multi-seed Qwen-pruning, seed = 44 <span style="color:#64748b;">(vLLM)</span></td>
               <td style="text-align:center;">Qwen</td>
               <td style="text-align:right;">30</td>
-              <td colspan="3" style="text-align:center; color:#64748b;">interrupted (script file deleted from workspace mid-sweep, re-running)</td>
-              <td style="text-align:right; color:#64748b;">—</td></tr>
+              <td style="text-align:right;">57.7% (15/26)</td>
+              <td style="text-align:right;">56.0% (14/25)</td>
+              <td style="text-align:right;">46.4% (13/28)</td>
+              <td style="text-align:right; color:#dc2626; font-weight:700;">−11.3 pp</td></tr>
+          <tr style="background:#f8fafc;"><td style="padding:0.4em 0.7em;">multi-seed Qwen-pruning, seed = 45 <span style="color:#64748b;">(vLLM)</span></td>
+              <td style="text-align:center;">Qwen</td>
+              <td style="text-align:right;">30</td>
+              <td style="text-align:right;">48.1% (13/27)</td>
+              <td style="text-align:right;">53.6% (15/28)</td>
+              <td style="text-align:right;">58.6% (17/29)</td>
+              <td style="text-align:right; color:#15803d; font-weight:700;">+10.5 pp</td></tr>
         </tbody>
         <tfoot>
           <tr style="background:#fef3c7; border-top:2px solid #d97706;">
@@ -2144,6 +2153,15 @@ Temporal properties:
             <td style="text-align:right;"><strong>59.6%</strong></td>
             <td style="text-align:right;"><strong>68.6%</strong></td>
             <td style="text-align:right; font-weight:700; color:#92400e;"><strong>+5.8 pp ± 12.4 pp</strong> <em>(95% CI)</em></td>
+          </tr>
+          <tr style="background:#fef3c7;">
+            <td style="padding:0.5em 0.7em;"><strong>4-seed Qwen-pruning pool (42 + 43 + 44 + 45)</strong></td>
+            <td style="text-align:center;">Qwen</td>
+            <td style="text-align:right;">30</td>
+            <td style="text-align:right;"><strong>57.0%</strong> (61/107)</td>
+            <td style="text-align:right;"><strong>58.3%</strong> (63/108)</td>
+            <td style="text-align:right;"><strong>61.5%</strong> (67/109)</td>
+            <td style="text-align:right; font-weight:700; color:#92400e;"><strong>+4.5 pp ± 13.6 pp</strong> <em>(95% CI)</em></td>
           </tr>
           <tr style="background:#fef3c7;">
             <td style="padding:0.5em 0.7em;"><strong>5-run cross-judge + multi-seed pool</strong></td>
@@ -2181,6 +2199,127 @@ Temporal properties:
       The narrative-level claim of the paper does <em>not</em> depend on this bonus result,
       since Pillars 1 and 2 frame GAS as a diagnostic, not as an attacker objective. We will
       revisit this table if seeds 44–46 land and shift the pooled CI off zero.
+      Seeds 44–45 (vLLM backend, L = 8) are now in the table; seed 46 was not run.
+    </div>
+
+    <h3 style="font-size:1.15em; font-weight:700; margin-top:1.8em; margin-bottom:0.5em; color:#2c3e50;">
+      Update: BCA guides search, judge picks deploy — and partial complementarity
+    </h3>
+    <p>
+      The any-leaf ASR column above treats a behavior as a success if <em>any</em> leaf in the
+      TAP tree scored 10/10 — the standard convention for reporting what the search
+      <em>found</em>. That hides a separate failure mode of pure-BCA pruning: the tree may
+      contain a jailbreak, but <code>best_objective</code> (selected by max BCA mass, not max
+      judge score) ships a different, safe-looking leaf. Across seeds 42–45, pure-BCA
+      <strong>deploy ASR</strong> (does the leaf we actually pick jailbreak?) is only
+      <strong>24.1%</strong> (26/108 completed runs) even though any-leaf ASR is
+      <strong>58.3%</strong> — more than half of discovered jailbreaks are thrown away at
+      selection time.
+    </p>
+    <p>
+      A cleaner operational split — which we have <em>not</em> yet run as a fourth in-loop method,
+      but can reconstruct post-hoc on existing BCA-pruned trees — is:
+      <strong>BCA shapes phase-2 pruning and attacker feedback; the external judge alone
+      picks the deploy prompt</strong> (argmax <code>regular_score</code> over all leaves).
+      Under that rule, deploy ASR on the same BCA trees rises to <strong>58.3%</strong>
+      (63/108), essentially matching regular any-leaf/deploy (<strong>57.0%</strong>, 61/107).
+      BCA is a reasonable <em>search</em> signal; it is a bad <em>selection</em> signal.
+    </p>
+
+    <div style="overflow-x:auto; margin: 1em 0;">
+      <table class="results-table" style="width:100%; border-collapse:collapse; font-size:0.93em;">
+        <thead>
+          <tr style="background:#e2e8f0; border-bottom:2px solid #94a3b8;">
+            <th style="text-align:left; padding:0.45em 0.7em;">Method (seeds 42–45 pooled)</th>
+            <th style="text-align:right; padding:0.45em 0.7em;">Any-leaf ASR<br><span style="font-weight:400; font-size:0.85em;">(search found a 10/10)</span></th>
+            <th style="text-align:right; padding:0.45em 0.7em;">Deploy ASR<br><span style="font-weight:400; font-size:0.85em;">(picked leaf is 10/10)</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td style="padding:0.4em 0.7em;">regular (judge prune + judge pick)</td>
+              <td style="text-align:right;">57.0% (61/107)</td>
+              <td style="text-align:right;">57.0% (61/107)</td></tr>
+          <tr style="background:#f8fafc;"><td style="padding:0.4em 0.7em;">bca (BCA prune + BCA pick)</td>
+              <td style="text-align:right;">58.3% (63/108)</td>
+              <td style="text-align:right; color:#dc2626; font-weight:700;">24.1% (26/108)</td></tr>
+          <tr><td style="padding:0.4em 0.7em;">bca + judge-pick <span style="color:#64748b;">(BCA tree, post-hoc deploy rule)</span></td>
+              <td style="text-align:right;">58.3% (63/108)</td>
+              <td style="text-align:right; color:#15803d; font-weight:700;">58.3% (63/108)</td></tr>
+          <tr style="background:#f8fafc;"><td style="padding:0.4em 0.7em;">hybrid (0.5·judge + 0.5·BCA throughout)</td>
+              <td style="text-align:right;">61.5% (67/109)</td>
+              <td style="text-align:right;">61.5% (67/109)</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      <strong>Complementary test-case coverage.</strong> On 102 paired (seed, behavior) runs where
+      both regular and BCA trees completed, deploy success sets overlap but do not coincide:
+    </p>
+    <div style="overflow-x:auto; margin: 1em 0;">
+      <table class="results-table" style="width:100%; border-collapse:collapse; font-size:0.93em;">
+        <thead>
+          <tr style="background:#e2e8f0; border-bottom:2px solid #94a3b8;">
+            <th style="text-align:left; padding:0.45em 0.7em;">Outcome</th>
+            <th style="text-align:right; padding:0.45em 0.7em;">Count</th>
+            <th style="text-align:right; padding:0.45em 0.7em;">Share of 102 pairs</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td style="padding:0.4em 0.7em;">Both regular deploy and BCA+judge-pick succeed</td>
+              <td style="text-align:right;">38</td>
+              <td style="text-align:right;">37.3%</td></tr>
+          <tr style="background:#f8fafc;"><td style="padding:0.4em 0.7em;">Regular-only (BCA+judge misses)</td>
+              <td style="text-align:right;">20</td>
+              <td style="text-align:right;">19.6%</td></tr>
+          <tr><td style="padding:0.4em 0.7em;">BCA+judge-pick-only (regular misses)</td>
+              <td style="text-align:right;">22</td>
+              <td style="text-align:right;">21.6%</td></tr>
+          <tr style="background:#f8fafc;"><td style="padding:0.4em 0.7em;">Neither succeeds</td>
+              <td style="text-align:right;">22</td>
+              <td style="text-align:right;">21.6%</td></tr>
+          <tr style="background:#dcfce7; border-top:2px solid #86efac;">
+              <td style="padding:0.5em 0.7em;"><strong>Union (either method deploys a jailbreak)</strong></td>
+              <td style="text-align:right;"><strong>80</strong></td>
+              <td style="text-align:right; font-weight:700;"><strong>78.4%</strong></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      Running both search strategies and succeeding if <em>either</em> deploys a jailbreak lifts
+      coverage from ~57% to ~78% (+21 pp), at 2× TAP cost. The trade is roughly symmetric
+      (20 regular-only vs 22 BCA+judge-only). Exclusive wins spread across the same three
+      HarmBench categories (<code>physical_harm</code>, <code>harassment_discrimination</code>,
+      <code>malware_hacking</code>) — BCA does not specialize on a different <em>class</em> of
+      test case, but it does reach a partially disjoint set of <em>individual behaviors</em>.
+      When both methods succeed on the same goal, the winning prompts are
+      <strong>never identical</strong> (0/38 pooled); framing often shifts (e.g. hypothetical
+      vs historical) even when both jailbreak.
+    </p>
+    <p>
+      <strong>The clean framing is:</strong> BCA does not necessarily increase attack success
+      per unit compute. Its value is in coverage per audit campaign. For the same target suite,
+      running judge-guided and BCA-guided TAP in parallel produces a larger and more diverse set
+      of successful jailbreaks than either search mode alone.
+    </p>
+    <div class="callout" style="background:#f0fdf4; border-left:4px solid #15803d; padding:1em 1.4em; margin:1.2em 0; border-radius:4px;">
+      <strong>Practical impact.</strong>
+      For adversarial training, the goal is not only to find one jailbreak cheaply; it is to
+      discover as many distinct failure modes as possible. Under this lens, BCA-guided search is
+      useful even when its standalone ASR is similar to regular TAP. At 2× TAP budget, the union
+      of regular and BCA-guided search raises deployable jailbreak coverage from ~57% to
+      78.4%, with roughly symmetric exclusive wins. Moreover, when both methods succeed on the
+      same behavior, the selected prompts are never identical, suggesting that BCA changes the
+      attack trajectory rather than simply rediscovering the same prompt. Thus BCA is best viewed
+      as a complementary search prior for red-team data generation and adversarial training, not
+      as a replacement for judge-based scoring.
+    </div>
+    <div class="callout" style="background:#f8fafc; border-left:4px solid #64748b; padding:1em 1.4em; margin:1.2em 0; border-radius:4px;">
+      <strong>Implementation note.</strong> Pure BCA-as-pruning is not robustly better than
+      judge-pruning on pooled any-leaf ASR, and it is substantially worse if BCA also picks the
+      deploy leaf (24.1% deploy vs 58.3% any-leaf). The operational split above — BCA prune,
+      judge pick — recovers deploy performance on existing trees. An in-loop
+      <code>bca_guide</code> method is queued after the L = 12 seed-44 replicate finishes.
     </div>
 
 
