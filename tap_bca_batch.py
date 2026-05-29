@@ -50,6 +50,7 @@ from pair_bca_llama import (
     iterative_feedback,
     judge_prompts,
     objective_value,
+    regular_iterative_feedback,
 )
 
 
@@ -223,7 +224,7 @@ def run_tap_one(
             pending, prompts, responses, regular_scores
         ):
             query_count += 1
-            should_compute_bca = method in ("bca", "hybrid") or args.always_log_bca
+            should_compute_bca = method in ("bca", "hybrid")
             if should_compute_bca:
                 bca_probability, bca_stats = bca_score_prompt(
                     goal,
@@ -264,12 +265,16 @@ def run_tap_one(
             child_conv.append(
                 {
                     "role": "user",
-                    "content": iterative_feedback(
-                        goal,
-                        response,
-                        regular_score,
-                        bca_probability,
-                        score_1_to_10,
+                    "content": (
+                        regular_iterative_feedback(goal, response, score_1_to_10)
+                        if method == "regular"
+                        else iterative_feedback(
+                            goal,
+                            response,
+                            regular_score,
+                            bca_probability,
+                            score_1_to_10,
+                        )
                     ),
                 }
             )
@@ -297,7 +302,11 @@ def run_tap_one(
             "TAP produced zero records (attacker never returned valid JSON)."
         )
 
-    best_objective = max(records, key=lambda r: r["objective_score"])
+    # BCA prunes by mass; deploy the highest judge-scored leaf (not max BCA).
+    if method == "bca":
+        best_objective = max(records, key=lambda r: float(r["regular_score"]))
+    else:
+        best_objective = max(records, key=lambda r: r["objective_score"])
     best_bca = max(records, key=lambda r: r["bca_probability"])
     return {
         **behavior,
@@ -521,8 +530,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--judge-batch-size", type=int, default=8)
     p.add_argument("--judge-device", default="cuda:1")
     p.add_argument("--device", default="cuda")
-    p.add_argument("--always-log-bca", action="store_true", default=True)
-    p.add_argument("--no-always-log-bca", dest="always_log_bca", action="store_false")
     p.add_argument("--redact-responses", action="store_true")
     p.add_argument("--seed", type=int, default=None)
     return p.parse_args()
