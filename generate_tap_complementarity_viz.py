@@ -10,16 +10,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 MULTISEED = ROOT / "results/judge_swap/multiseed"
-OUT_DATA = MULTISEED / "tap_complementarity_data.json"
-OUT_HTML = ROOT / "gpu_llmchecker/tap_complementarity_viz.html"
+OUT_DATA = MULTISEED / "tap_complementarity_data_seed44.json"
+OUT_HTML = ROOT / "gpu_llmchecker/tap_complementarity_viz_seed44.html"
 
 DATASETS = [
-    ("pooled_42_45", "Pooled seeds 42–45", [
-        "tap_llama_qwen_seed42.json",
-        "tap_llama_qwen_seed43.json",
-        "tap_llama_qwen_seed44.json",
-        "tap_llama_qwen_seed45.json",
-    ]),
     ("seed44_l8", "Seed 44 · L=8 · vLLM", ["tap_llama_qwen_seed44.json"]),
     ("seed44_l12_fixed", "Seed 44 · L=12 fixed (clean regular + BCA judge-pick)", [
         "tap_llama_qwen_seed44_L12_fixed.json",
@@ -27,7 +21,6 @@ DATASETS = [
     ("seed44_l12_old", "Seed 44 · L=12 old (confounded regular)", [
         "tap_llama_qwen_seed44_L12.json",
     ]),
-    ("seed45_l8", "Seed 45 · L=8 · vLLM", ["tap_llama_qwen_seed45.json"]),
 ]
 
 OUTCOMES = ("both", "regular_only", "bca_only", "neither")
@@ -168,7 +161,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>TAP Regular vs BCA — Complementarity Explorer</title>
+  <title>Seed 44 — TAP Regular vs BCA Complementarity</title>
   <style>
     :root {
       --both: #15803d; --reg: #2563eb; --bca: #9333ea; --neither: #64748b;
@@ -226,9 +219,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>TAP Regular vs BCA — Complementarity Explorer</h1>
-  <p>Deploy success (judge = 10/10): regular uses judge-only pruning + pick; BCA uses BCA pruning + judge pick.
-     Click outcome cells or chips to filter behaviors. Categories show where the two search modes agree or disagree.</p>
+  <h1>Seed 44 — Regular vs BCA Complementarity</h1>
+  <p>Deploy success (judge = 10/10) on seed 44 only. Compare L=8, L=12 fixed (clean baseline), and L=12 old runs.
+     Click outcome cells or chips to filter behaviors.</p>
 </header>
 <main>
   <div class="toolbar">
@@ -257,7 +250,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <h2>Behaviors <span id="beh-count" style="color:var(--muted);font-weight:400"></span></h2>
     <div class="scroll">
       <table>
-        <thead><tr><th>Outcome</th><th>Category</th><th>Seed</th><th>Goal</th><th>Regular prompt</th><th>BCA prompt</th></tr></thead>
+        <thead><tr><th>Outcome</th><th>Category</th><th>Goal</th><th>Regular prompt</th><th>BCA prompt</th></tr></thead>
         <tbody id="tbody"></tbody>
       </table>
     </div>
@@ -377,7 +370,6 @@ function renderTable() {
   tb.innerHTML = rows.map(r => `<tr>
     <td><span class="tag ${r.outcome}">${DATA.outcome_labels[r.outcome]}</span></td>
     <td>${DATA.category_labels[r.category] || r.category}</td>
-    <td>${r.seed ?? '—'}</td>
     <td>${esc(r.goal)}${r.same_prompt && r.outcome==='both' ? ' <em style="color:var(--both)">same prompt</em>' : ''}</td>
     <td class="prompt">${r.regular_deploy ? esc(r.regular_prompt) : '—'}</td>
     <td class="prompt">${r.bca_deploy ? esc(r.bca_prompt) : '—'}</td>
