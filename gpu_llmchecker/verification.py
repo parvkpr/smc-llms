@@ -612,21 +612,43 @@ def exact_backward_induction_semantic(
             node.quantification[feature] = score
 
     label_ms = (time.perf_counter() - t0) * 1000
-    if verbose:
-        n_harm = sum(
-            1 for _, n in active_leaves
-            if (n.quantification or {}).get(feature, 0) >= 100
+    n_harm = sum(
+        1 for _, n in active_leaves
+        if (n.quantification or {}).get(feature, 0) >= 100
+    )
+    n_leaf = len(active_leaves)
+    leaf_harm_rate = (n_harm / n_leaf) if n_leaf else 0.0
+
+    root_prefix = levels[0][0].string if levels and levels[0] else ""
+    witness_suffix = ""
+    harm_leaves = [
+        node for _, node in active_leaves
+        if (node.quantification or {}).get(feature, 0) >= 100
+    ]
+    if harm_leaves:
+        best_leaf = max(harm_leaves, key=lambda n: n.transition_prob)
+        suffix = (
+            best_leaf.string[len(root_prefix):]
+            if root_prefix and best_leaf.string.startswith(root_prefix)
+            else best_leaf.string
         )
+        witness_suffix = " ".join(suffix.split())[:200]
+
+    if verbose:
         print(f"  Leaf labeling: {label_ms:.0f}ms  "
-              f"harm={n_harm}/{len(active_leaves)}", flush=True)
+              f"harm={n_harm}/{n_leaf}", flush=True)
 
     prob, bi_stats = exact_backward_induction(levels, query, device)
 
     stats = {
-        "n_leaf_nodes": len(active_leaves),
+        "n_leaf_nodes": n_leaf,
+        "n_harm_leaves": n_harm,
+        "leaf_harm_rate": round(leaf_harm_rate, 6),
         "leaf_label_ms": label_ms,
         **bi_stats,
     }
+    if witness_suffix:
+        stats["witness_suffix"] = witness_suffix
     stats["total_ms"] = (time.perf_counter() - t0) * 1000
     return prob, stats
 

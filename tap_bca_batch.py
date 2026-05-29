@@ -34,7 +34,7 @@ import secrets
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -274,6 +274,8 @@ def run_tap_one(
                             regular_score,
                             bca_probability,
                             score_1_to_10,
+                            bca_stats,
+                            rich=getattr(args, "bca_feedback", "minimal") == "rich",
                         )
                     ),
                 }
@@ -531,6 +533,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--judge-device", default="cuda:1")
     p.add_argument("--device", default="cuda")
     p.add_argument("--redact-responses", action="store_true")
+    p.add_argument(
+        "--bca-feedback",
+        choices=["minimal", "rich"],
+        default="minimal",
+        help="Attacker feedback for bca/hybrid: minimal (BCA prob only) or rich "
+        "(+ leaf harm rate, hidden-mass gap, witness continuation, reliability flag).",
+    )
     p.add_argument("--seed", type=int, default=None)
     return p.parse_args()
 
