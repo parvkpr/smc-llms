@@ -375,6 +375,34 @@ def _build_target_backend(args: argparse.Namespace) -> Any:
     return HFBackend(args.target_model, device=device, batch_size=args.target_batch_size)
 
 
+def _resolve_gpu_layout(args: argparse.Namespace) -> None:
+    """Place target, attacker, and judge on separate GPUs when possible."""
+    if args.device == "cuda":
+        args.device = "cuda:0"
+
+    if args.attack_model == args.target_model:
+        return
+
+    # Two GPUs, three models: target vLLM alone on GPU 1; attacker + judge HF on GPU 0.
+    args.device = "cuda:1"
+    args.attack_device = "cuda:0"
+    args.judge_device = "cuda:0"
+    if args.judge_backend == "vllm":
+        print(
+            "Note: --judge-backend vllm incompatible with HF attacker on cuda:0; "
+            "using HF judge on cuda:0.",
+            flush=True,
+        )
+        args.judge_backend = "hf"
+
+    print(
+        f"GPU layout: target vLLM {args.device}; "
+        f"attack HF {args.attack_device}; "
+        f"judge {args.judge_backend} {args.judge_device}",
+        flush=True,
+    )
+
+
 def _build_attack_backend(args: argparse.Namespace) -> Any:
     """HF attacker on a separate GPU when target uses vLLM."""
     device = args.attack_device
@@ -416,6 +444,8 @@ def main(args: argparse.Namespace) -> None:
     if args.seed is not None:
         _set_seed(args.seed)
 
+    _resolve_gpu_layout(args)
+
     behaviors = load_behaviors(args.behaviors_json, args.limit)
     methods = [m.strip() for m in args.methods.split(",") if m.strip()]
 
@@ -437,6 +467,7 @@ def main(args: argparse.Namespace) -> None:
     print("Loading target model:", args.target_model, flush=True)
     prev_cuda = os.environ.get("CUDA_VISIBLE_DEVICES")
     target_backend = _build_target_backend(args)
+
     if args.attack_model != args.target_model:
         if prev_cuda is None:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
@@ -512,8 +543,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--attack-model", default="meta-llama/Llama-3.1-8B-Instruct")
     p.add_argument(
         "--attack-device",
-        default="cuda:1",
-        help="Device for HF attacker when --attack-model != --target-model.",
+        default="cuda:0",
+        help="GPU for HF attacker when --attack-model != --target-model "
+        "(auto: cuda:0 with target on cuda:1).",
     )
     p.add_argument("--judge-model", default="Qwen/Qwen2.5-7B-Instruct")
     p.add_argument(
