@@ -11,20 +11,49 @@ from typing import Any, Dict, List, Optional, Tuple
 ROOT = Path(__file__).resolve().parent
 MULTISEED = ROOT / "results/judge_swap/multiseed"
 OUT_DATA = MULTISEED / "tap_complementarity_data_seed44.json"
-OUT_HTML = ROOT / "gpu_llmchecker/tap_complementarity_viz_seed44.html"
+OUT_HTML_SEED44 = ROOT / "gpu_llmchecker/tap_complementarity_viz_seed44.html"
+OUT_HTML = ROOT / "gpu_llmchecker/tap_complementarity_viz.html"
 
 DATASETS = [
-    ("seed44_l8", "Seed 44 · L=8 · vLLM", ["tap_llama_qwen_seed44.json"]),
-    ("seed44_l12_fixed", "Seed 44 · L=12 fixed (clean regular + BCA judge-pick)", [
+    ("seed44_l8", "Seed 44 · L=8 · vLLM · 30 beh", ["tap_llama_qwen_seed44.json"]),
+    ("seed44_l12_fixed", "Seed 44 · L=12 fixed · 30 beh (clean regular + BCA judge-pick)", [
         "tap_llama_qwen_seed44_L12_fixed.json",
     ]),
-    ("seed44_l12_old", "Seed 44 · L=12 old (confounded regular)", [
+    ("seed44_l12_old", "Seed 44 · L=12 old · 30 beh (confounded regular)", [
         "tap_llama_qwen_seed44_L12.json",
     ]),
+    (
+        "seed44_l12_100_regular_rich_bca",
+        "Seed 44 · L=12 · 100 beh · regular+rich feedback + BCA judge-pick",
+        ["tap_llama_qwen_seed44_L12_regular_rich_bca_100.json"],
+    ),
 ]
 
 OUTCOMES = ("both", "regular_only", "bca_only", "neither")
-CAT_ORDER = ("harassment_discrimination", "physical_harm", "malware_hacking")
+CAT_ORDER = (
+    "harassment_discrimination",
+    "malware_hacking",
+    "physical_harm",
+    "economic_harm",
+    "fraud_deception",
+    "disinformation",
+    "sexual_adult_content",
+    "privacy",
+    "expert_advice",
+    "government_decision-making",
+)
+CAT_LABELS = {
+    "harassment_discrimination": "Harassment / discrimination",
+    "malware_hacking": "Malware / hacking",
+    "physical_harm": "Physical harm",
+    "economic_harm": "Economic harm",
+    "fraud_deception": "Fraud / deception",
+    "disinformation": "Disinformation",
+    "sexual_adult_content": "Sexual / adult content",
+    "privacy": "Privacy",
+    "expert_advice": "Expert advice",
+    "government_decision-making": "Government decision-making",
+}
 
 
 def _deploy_regular(row: dict) -> bool:
@@ -32,13 +61,8 @@ def _deploy_regular(row: dict) -> bool:
 
 
 def _deploy_bca(row: dict) -> bool:
-    bo = row.get("best_objective", {})
-    if float(bo.get("regular_score") or 0) >= 10:
-        return True
-    return max(
-        (float(x.get("regular_score") or 0) for x in row.get("records", [])),
-        default=0,
-    ) >= 10
+    """Deploy success for BCA trees with judge-pick deploy (best_objective only)."""
+    return _deploy_regular(row)
 
 
 def _outcome(reg_ok: bool, bca_ok: bool) -> str:
@@ -146,11 +170,7 @@ def build_payload() -> dict:
             "bca_only": "BCA only",
             "neither": "Neither",
         },
-        "category_labels": {
-            "harassment_discrimination": "Harassment / discrimination",
-            "physical_harm": "Physical harm",
-            "malware_hacking": "Malware / hacking",
-        },
+        "category_labels": CAT_LABELS,
         "category_order": list(CAT_ORDER),
         "datasets": datasets,
     }
@@ -220,7 +240,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <body>
 <header>
   <h1>Seed 44 — Regular vs BCA Complementarity</h1>
-  <p>Deploy success (judge = 10/10) on seed 44 only. Compare L=8, L=12 fixed (clean baseline), and L=12 old runs.
+  <p>Deploy success (judge = 10/10 on <code>best_objective</code>) for seed-44 TAP runs.
+     Includes the 30-behavior L=8 / L=12 replicates and the 100-behavior run with
+     <strong>regular + rich BCA feedback</strong> vs BCA (judge-pick deploy).
      Click outcome cells or chips to filter behaviors.</p>
 </header>
 <main>
@@ -389,8 +411,17 @@ def main() -> None:
     OUT_DATA.parent.mkdir(parents=True, exist_ok=True)
     OUT_DATA.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     html = HTML_TEMPLATE.replace("__DATA_JSON__", json.dumps(payload))
-    OUT_HTML.write_text(html, encoding="utf-8")
+    OUT_HTML_SEED44.write_text(html, encoding="utf-8")
+    explorer = html.replace(
+        "<title>Seed 44 — TAP Regular vs BCA Complementarity</title>",
+        "<title>TAP Regular vs BCA — Complementarity Explorer</title>",
+    ).replace(
+        "<h1>Seed 44 — Regular vs BCA Complementarity</h1>",
+        "<h1>TAP Regular vs BCA Complementarity</h1>",
+    )
+    OUT_HTML.write_text(explorer, encoding="utf-8")
     print(f"Wrote {OUT_DATA}")
+    print(f"Wrote {OUT_HTML_SEED44}")
     print(f"Wrote {OUT_HTML}")
     for ds in payload["datasets"]:
         s = ds["summary"]

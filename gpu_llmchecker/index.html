@@ -2322,6 +2322,92 @@ Temporal properties:
       <code>bca_guide</code> method is queued after the L = 12 seed-44 replicate finishes.
     </div>
 
+    <h3 style="font-size:1.15em; font-weight:700; margin-top:1.8em; margin-bottom:0.5em; color:#2c3e50;">
+      Update: 100-behavior complementarity — regular + rich BCA feedback
+    </h3>
+    <p>
+      The 30-behavior TAP runs above cover only the first three HarmBench categories
+      (<code>harassment_discrimination</code>, <code>malware_hacking</code>,
+      <code>physical_harm</code>). To stress-test complementarity on the full suite, we ran
+      seed&nbsp;44 at <em>L</em>&nbsp;=&nbsp;12 on all <strong>100 behaviors</strong> (10 categories)
+      with two methods only:
+      <strong>regular + rich BCA attacker feedback</strong> (BCA computed for feedback only; pruning
+      and deploy still judge-only) and <strong>BCA with judge-pick deploy</strong> (BCA prune,
+      argmax <code>regular_score</code> for deploy). Same TAP tree settings as the L=12 fixed runs
+      (<code>b=2, w=3, d=3</code>, Qwen legacy judge, vLLM backends).
+    </p>
+
+    <div style="overflow-x:auto; margin: 1em 0;">
+      <table class="results-table" style="width:100%; border-collapse:collapse; font-size:0.93em;">
+        <thead>
+          <tr style="background:#e2e8f0; border-bottom:2px solid #94a3b8;">
+            <th style="text-align:left; padding:0.45em 0.7em;">Method (seed 44 · 100 beh · L=12)</th>
+            <th style="text-align:right; padding:0.45em 0.7em;">Deploy ASR<br><span style="font-weight:400; font-size:0.85em;">(completed runs)</span></th>
+            <th style="text-align:right; padding:0.45em 0.7em;">Errors</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td style="padding:0.4em 0.7em;">regular + rich BCA feedback</td>
+              <td style="text-align:right; font-weight:700;">43.0% (37/86)</td>
+              <td style="text-align:right;">14</td></tr>
+          <tr style="background:#f8fafc;"><td style="padding:0.4em 0.7em;">BCA prune + judge-pick deploy</td>
+              <td style="text-align:right;">36.9% (31/84)</td>
+              <td style="text-align:right;">16</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      On <strong>80 paired behaviors</strong> where both trees completed, deploy complementarity is:
+    </p>
+    <div style="overflow-x:auto; margin: 1em 0;">
+      <table class="results-table" style="width:100%; border-collapse:collapse; font-size:0.93em;">
+        <thead>
+          <tr style="background:#e2e8f0; border-bottom:2px solid #94a3b8;">
+            <th style="text-align:left; padding:0.45em 0.7em;">Outcome</th>
+            <th style="text-align:right; padding:0.45em 0.7em;">Count</th>
+            <th style="text-align:right; padding:0.45em 0.7em;">Share of 80 pairs</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td style="padding:0.4em 0.7em;">Both deploy succeed</td>
+              <td style="text-align:right;">19</td>
+              <td style="text-align:right;">23.8%</td></tr>
+          <tr style="background:#f8fafc;"><td style="padding:0.4em 0.7em;">Regular+rich only</td>
+              <td style="text-align:right;">15</td>
+              <td style="text-align:right;">18.8%</td></tr>
+          <tr><td style="padding:0.4em 0.7em;">BCA+judge-pick only</td>
+              <td style="text-align:right;">10</td>
+              <td style="text-align:right;">12.5%</td></tr>
+          <tr style="background:#f8fafc;"><td style="padding:0.4em 0.7em;">Neither deploys</td>
+              <td style="text-align:right;">36</td>
+              <td style="text-align:right;">45.0%</td></tr>
+          <tr style="background:#dcfce7; border-top:2px solid #86efac;">
+              <td style="padding:0.5em 0.7em;"><strong>Union (either method)</strong></td>
+              <td style="text-align:right;"><strong>44</strong></td>
+              <td style="text-align:right; font-weight:700;"><strong>55.0%</strong></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      Compared with the 30-behavior fixed replicate (union <strong>78.4%</strong> on 102 pooled pairs),
+      full-suite coverage is lower and the neither-fail bucket is larger (45%) — harder categories
+      (disinformation, fraud, privacy, expert advice, etc.) dominate the long tail. Regular with
+      rich feedback still edges BCA on deploy ASR (43.0% vs 36.9%) and wins more exclusive behaviors
+      (18.8% vs 12.5% of pairs). On the overlapping 30-behavior slice inside this run, regular+rich
+      is <strong>11/25 (44%)</strong> vs <strong>17/27 (63%)</strong> in the dedicated 30-behavior
+      regular-only ablation — different RNG coupling because BCA runs interleave per behavior — so
+      treat the 30-beh ablation and 100-beh run as separate stochastic replicates.
+    </p>
+    <p>
+      <a href="tap_complementarity_viz_seed44.html" style="font-weight:600;">
+        Interactive complementarity explorer →
+      </a>
+      Filter by outcome, category, and dataset (includes L=8 / L=12 fixed 30-beh runs and this
+      100-behavior replicate). Raw JSON:
+      <code>results/judge_swap/multiseed/tap_llama_qwen_seed44_L12_regular_rich_bca_100.json</code>.
+    </p>
+
 
     <!-- ── Validation Roadmap ── -->
     <h2 class="section-heading" id="validation-roadmap">Validation Roadmap: Judge, Attacker, and Target Scaling</h2>
