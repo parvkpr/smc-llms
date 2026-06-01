@@ -375,6 +375,18 @@ def _build_target_backend(args: argparse.Namespace) -> Any:
     return HFBackend(args.target_model, device=device, batch_size=args.target_batch_size)
 
 
+def _build_attack_backend(args: argparse.Namespace) -> Any:
+    """HF attacker on a separate GPU when target uses vLLM."""
+    device = args.attack_device
+    print(
+        f"Attack: HF on {device} ({args.attack_model})",
+        flush=True,
+    )
+    return HFBackend(
+        args.attack_model, device=device, batch_size=args.attack_batch_size
+    )
+
+
 def _build_judge(args: argparse.Namespace):
     if args.judge_backend == "vllm":
         idx = _dev_idx(args.judge_device)
@@ -424,18 +436,15 @@ def main(args: argparse.Namespace) -> None:
 
     print("Loading target model:", args.target_model, flush=True)
     prev_cuda = os.environ.get("CUDA_VISIBLE_DEVICES")
-    target_device = args.device if args.device != "cuda" else "cuda:0"
     target_backend = _build_target_backend(args)
-    attack_backend = target_backend
     if args.attack_model != args.target_model:
-        print("Loading attack model:", args.attack_model, flush=True)
-        if args.target_backend == "vllm":
-            raise NotImplementedError(
-                "Separate --attack-model with --target-backend vllm is not supported."
-            )
-        attack_backend = HFBackend(
-            args.attack_model, device=target_device, batch_size=args.attack_batch_size
-        )
+        if prev_cuda is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda
+        attack_backend = _build_attack_backend(args)
+    else:
+        attack_backend = target_backend
 
     print("Loading semantic judge:", args.judge_model, flush=True)
     judge_pipeline = _build_judge(args)
@@ -501,6 +510,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--target-model", default="meta-llama/Llama-3.1-8B-Instruct")
     p.add_argument("--attack-model", default="meta-llama/Llama-3.1-8B-Instruct")
+    p.add_argument(
+        "--attack-device",
+        default="cuda:1",
+        help="Device for HF attacker when --attack-model != --target-model.",
+    )
     p.add_argument("--judge-model", default="Qwen/Qwen2.5-7B-Instruct")
     p.add_argument(
         "--judge-type",
