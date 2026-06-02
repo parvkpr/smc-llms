@@ -51,8 +51,9 @@
 \newcommand{\TV}{\mathrm{TV}}
 
 \title{\vspace{-1.5em}
-Long-Horizon Bounded Continuation Analysis\\
-via Abstract-State Markov Chains}
+Beyond Attack Success Rate:\\
+Bounded Continuation Analysis and Long-Horizon Extrapolation\\
+of Harmful Probability Mass in LLM Outputs}
 
 \author{
 Parv Kapoor\\
@@ -66,75 +67,504 @@ Carnegie Mellon University\\
 \maketitle
 
 \begin{abstract}
-Bounded continuation analysis (\BCA) treats autoregressive language-model generation as a finite-horizon \DTMC{} over token-prefix states and computes the probability of reaching a harmful continuation within an $\alpha$-$k$ bounded tree.  Its main practical limitation is horizon: state count grows as $O(k^L)$ in the worst case, so the tractable depth $L$ is typically far shorter than the realised completions a deployed model produces.  Bounded harm computed at $L=8$ thus describes what the model commits to early, not what it ultimately produces.
+Standard jailbreak evaluation usually asks an outcome-level question: did a sampled model response contain harmful content?  This question is necessary, and benchmarks such as HarmBench and JailbreakBench have made it substantially more reproducible by standardizing behaviors, prompts, threat models, judges, and attack success-rate metrics.  However, sampled attack success rate is incomplete.  It measures realized completions, not the conditional output distribution that produced them.  A model may refuse under greedy decoding while assigning nontrivial probability mass to nearby harmful continuations; conversely, a defense may reduce sampled attack success while leaving the harmful probability mass largely intact.
 
-We study whether an abstract-state Markov chain, fitted on a \emph{shallow} concrete bounded tree, can extrapolate $\Prob[\mathbf{F}\,\harm]$ to longer horizons.  The concrete state space is collapsed by a semantic judge into four abstract states ($\refusal$, $\harm$, $\compliance$, $\ambiguous$), and an empirical transition matrix is learned from the first $L_\mathrm{train}$ depths of the concrete tree.  Forward propagation under absorbing $\refusal$ and $\harm$ states then estimates harmful reachability at $L_\mathrm{max} \gg L_\mathrm{train}$.
+We propose \emph{bounded continuation analysis} (\BCA), a distributional diagnostic for LLM safety evaluation.  Given a prompt, a model, a horizon $L$, a top-$k$ cap, and a cumulative probability threshold $\alpha$, \BCA{} constructs an $\alpha$-$k$ bounded continuation tree, labels terminal continuations with a semantic harm judge, and computes the probability of eventually reaching a harmful state in the bounded process.  For small trees this probability is computed exactly by sparse backward induction over the induced finite \DTMC; for larger sweeps it is estimated by statistical model checking with confidence bounds.  Across JailbreakBench behaviors and four instruction-tuned models, \BCA{} reveals harmful probability mass that greedy \ASR{} misses, distinguishes models that all score greedy \ASR{} $=0$, identifies jailbreak-template families that unlock hidden mass, and predicts empirical attack success with Spearman $\rho=0.66$.
 
-Three internally-validating experiments on JailbreakBench behaviors and Qwen2.5-1.5B-Instruct establish where the abstraction works and where it fails.  The lumping itself is information-preserving for $\mathbf{F}\,\harm$ (lumping error $\leq 10^{-16}$ across all behaviors).  On twenty saturated jailbroken behaviors, the depth-conditional Markov fit reaches mean absolute error $0.003$ against the concrete ground truth at $L_\mathrm{max}=10$ when $L_\mathrm{train}=5$; the stationary average underestimates by a near-constant $0.10$.  On twenty hesitant un-jailbroken behaviors, the same fit overshoots by $0.27$ on the cases where $\Prob[\mathbf{F}\,\harm] > 0$.  A single outlier behavior (\textsc{sudo\_access}) misses by $0.99$ because its compliance decision occurs at depth $6$, outside the $L_\mathrm{train}=5$ window.
+The structural limitation of \BCA{} is horizon: exact verification costs scale as $O(k^L)$, so the tractable $L$ is typically $\leq 10$, while deployed completions extend to hundreds of tokens.  To close this gap we study whether an \emph{abstract-state Markov chain}, fitted on a shallow concrete bounded tree, can extrapolate $\Prob[\mathbf{F}\,\harm]$ to longer horizons.  The concrete state space is collapsed by a semantic judge into four abstract states ($\refusal$, $\harm$, $\compliance$, $\ambiguous$); an empirical transition matrix is learned from the first $L_\mathrm{train}$ depths; forward propagation under absorbing $\refusal$ and $\harm$ states estimates harmful reachability at $L_\mathrm{max} \gg L_\mathrm{train}$.  The lumping itself is information-preserving for $\mathbf{F}\,\harm$ (lumping error $\leq 10^{-16}$ across all behaviors tested).  On twenty saturated jailbroken behaviors, the depth-conditional fit reaches mean absolute error $0.003$ against the concrete ground truth at $L_\mathrm{max}=10$ when $L_\mathrm{train}=5$.  On twenty hesitant un-jailbroken behaviors the same fit overshoots by $0.27$ on cases with $\Prob[\mathbf{F}\,\harm] > 0$.  A single outlier behavior misses by $0.99$ because its compliance decision occurs at depth $6$, outside the $L_\mathrm{train}=5$ window.  A unified mechanism---the position of the model's compliance-decision depth $d^*$ relative to $L_\mathrm{train}$---explains every failure mode and is detectable in advance from a stationarity diagnostic of the trained chain.
 
-The unified explanation is that the abstract chain is accurate exactly when the model's compliance decision falls inside $L_\mathrm{train}$.  Stationarity and lumpability diagnostics confirm the failure modes.  We discuss the practical consequences: the abstraction is conservative in the verification setting (the typical failure mode is overshoot, not undershoot), and reliable for already-jailbroken templates, which is the regime in which the abstraction is most useful for adversarial search.
+Together, the two contributions support a diagnostic reframe: not merely \emph{did the model jailbreak?}, but \emph{how much harmful probability mass is nearby, where does refusal break, which templates expose the most hidden mass, and how does that mass evolve at horizons beyond the enumerable tree?}
 \end{abstract}
 
 \section{Introduction}
 \label{sec:intro}
 
-Bounded continuation analysis (\BCA) is a distributional diagnostic for language-model safety \cite{ourbca}.  Given a prompt, an autoregressive model, a horizon $L$, a top-$k$ cap, and a cumulative probability threshold $\alpha$, \BCA{} expands the model's next-token distribution into an $\alpha$-$k$ bounded tree of depth $L$, labels terminal continuations with a semantic harm judge, and computes the probability of eventually reaching a harmful state by sparse backward induction over the induced finite \DTMC.  The resulting object, $\Prob[\mathbf{F}\,\harm]$, is sensitive to harmful probability mass that a single greedy decode misses, separates models that all score greedy \ASR{} $=0$, and provides a ranking signal for jailbreak template selection.
+Large-language-model safety evaluation is often operationalized as a binary classification problem.  Given a harmful behavior and an adversarial prompt, the model is sampled, the response is judged, and the run is counted as either a successful attack or a refusal/safe response.  The resulting attack success rate (\ASR) is easy to report, easy to compare, and central to modern red-team evaluation.
 
-\BCA{} as defined above has one structural limitation: the bounded tree has at most $k^L$ leaves, and exact verification scales with this product.  In practice this forces $L$ to be small, typically $L \in \{6,8,10\}$ at $k \in \{2,3\}$.  But deployed language models routinely generate hundreds of tokens.  An estimate of $\Prob[\mathbf{F}\,\harm]$ over the first eight tokens describes what the model \emph{commits to early}, not what it ultimately produces.  For behaviors where the model decides to comply quickly, the two coincide; for behaviors where the compliance decision develops over longer horizons, the short-horizon estimate is structurally incomplete.
+This framing is useful, but it is only a view of the sampled surface.  Autoregressive language models define distributions over continuations.  A single decoded response, even a greedy one, observes only one path through that distribution.  Two models can therefore have identical sampled \ASR{} and radically different local safety structure.  One may refuse because nearly all likely continuations route to refusal.  Another may refuse only on the modal path while assigning substantial mass to lower-probability continuations that become harmful.  From the perspective of deployment risk, debugging, and model comparison, those are different systems.
 
-This paper asks whether a small abstract-state Markov chain, fitted on the existing shallow concrete tree, can extrapolate $\Prob[\mathbf{F}\,\harm]$ to longer horizons without paying the $O(k^L)$ expansion cost.  The conceptual move is standard for probabilistic model checking: replace an intractable concrete chain with a tractable abstraction whose transitions track only the safety-relevant equivalence class of each concrete state.  We use four abstract states---$\refusal$, $\harm$, $\compliance$, $\ambiguous$---defined by a semantic harm judge plus a phrase-based refusal detector and a length-based compliance gate.  The Markov transition matrix is estimated empirically from the shallow concrete tree.  Forward propagation under absorbing $\refusal$ and $\harm$ states then gives a long-horizon estimate of $\Prob[\mathbf{F}\,\harm]$.
+This paper has two complementary contributions.
+
+The first half asks whether jailbreak evaluation can expose the hidden distributional structure that \ASR{} cannot see.  Instead of measuring only whether a sampled completion is harmful, we estimate the probability mass assigned to harmful continuations within a bounded neighborhood of the model's output distribution.  We call this \emph{bounded continuation analysis} (\BCA).  The core idea is to view autoregressive generation as a finite-horizon discrete-time Markov chain over token-prefix states.  The full chain is intractable, so we construct an $\alpha$-$k$ bounded tree: at each prefix, we retain the most probable next tokens up to a cap $k$ and cumulative mass threshold $\alpha$, renormalize the retained edges, and continue to depth $L$.  A semantic harm judge labels terminal continuations; reachability analysis then computes $\Prob[\mathbf{F}\,\harm]$, the probability that the bounded process eventually reaches a harmful state.
+
+The second half addresses the structural limitation that the first half inherits.  Even with GPU batching and sparse backward induction, exact \BCA{} scales as $O(k^L)$, which limits the horizon $L$ in practice to single digits while deployed completions extend much further.  We study a representational fix: lump concrete prefix states into a small safety-relevant abstract space, fit a Markov chain on the shallow tree, and forward-simulate to longer horizons.  The lumping is exact for the $\mathbf{F}\,\harm$ property under absorbing semantics; the Markov fit is empirically accurate in the regime where it matters most for \BCA-guided adversarial search (jailbroken, commitment templates), with detectable failure modes elsewhere.
+
+This is not a proof of global safety.  It is local to a prompt, model, decoding process, horizon, bounding rule, and evaluator.  That narrower claim is still useful, because ordinary evaluation often observes only a handful of samples.  Together, \BCA{} and its long-horizon extension give a two-stage diagnostic for prompts where the visible output looks safe but the distribution remains fragile.
 
 \paragraph{Contributions.}
-We make four contributions.
+We make seven contributions.
 
 \begin{enumerate}[leftmargin=*,itemsep=2pt]
-  \item We formalize a 4-state safety-relevant abstraction of the $\alpha$-$k$ bounded \DTMC{} used by \BCA{} and show that under absorbing $\mathbf{F}\,\harm$ semantics the lumping is information-preserving for the property of interest.
-  \item We propose two estimators of long-horizon bounded harmful mass: a stationary fit that averages observed transitions across $L_\mathrm{train}$ depths, and a depth-conditional fit that keeps a separate matrix per training depth.
-  \item We define lumpability and stationarity diagnostics that report, per behavior, why the abstraction is succeeding or failing.
-  \item We evaluate the method on three matched conditions---hesitant un-jailbroken behaviors, saturated jailbroken behaviors, and a controlled smoke set---and identify a single mechanism (the decision-moment depth relative to $L_\mathrm{train}$) that explains every observed failure mode.
+  \item We formalize bounded continuation analysis for adversarial LLM evaluation as finite-horizon reachability over an $\alpha$-$k$ bounded \DTMC{} induced by an autoregressive model (\Cref{sec:problem,sec:method-bca}).
+  \item We define semantic harmful-mass metrics, including $\Prob[\mathbf{F}\,\harm]$, refusal-collapse probability, and bounded safety probability, and show how to compute them by exact backward induction or statistical model checking (\Cref{sec:method-bca}).
+  \item We evaluate \BCA{} on JailbreakBench harmful behaviors using Qwen2.5-1.5B-Instruct, Qwen2.5-7B-Instruct, Mistral-7B-Instruct-v0.2, and Llama-3.1-8B-Instruct, with Qwen2.5-7B used as the semantic harm judge in semantic experiments (\Cref{sec:rq1,sec:rq2,sec:rq3,sec:rq4}).
+  \item We show that bounded harmful mass reveals hidden risk invisible to greedy \ASR, separates models that all score greedy \ASR{} $=0$, provides a useful gradient-free search signal for jailbreak-template selection, and predicts empirical \ASR{} under held-out completion sampling (\Cref{sec:rq1,sec:rq2,sec:rq3,sec:rq4}).
+  \item We identify the short-horizon limitation of \BCA{} as the dominant residual error source between $\Prob[\mathbf{F}\,\harm]$ at $L=8$ and empirical full-completion \ASR{} (\Cref{sec:short-horizon}).
+  \item We formalize a 4-state safety-relevant abstraction of the bounded \DTMC{} and prove that under absorbing $\mathbf{F}\,\harm$ semantics the lumping is information-preserving for the property of interest (\Cref{sec:method-abstract}).
+  \item We evaluate stationary and depth-conditional Markov fits on hesitant and jailbroken JBB subsets, identify a single mechanism (the decision-moment depth $d^*$ relative to $L_\mathrm{train}$) that explains every observed failure mode, and propose stationarity and lumpability diagnostics that detect those failure modes without building the long-horizon concrete tree (\Cref{sec:abstract-results,sec:discussion}).
 \end{enumerate}
 
-\section{Background: Bounded Continuation Analysis}
+\section{Background and Motivation}
 \label{sec:background}
 
-\subsection{From LLM Generation to a Bounded DTMC}
+\subsection{Attack Success Rate}
 
-Let $x$ be a prompt and let $M$ be an autoregressive model with vocabulary $\calV$.  A length-$L$ continuation $y = (t_1,\ldots,t_L)$ has probability $P_M(y \mid x) = \prod_{\ell} P_M(t_\ell \mid x, t_{<\ell})$.  The full induced Markov chain over prefix states is infeasible to enumerate, so \BCA{} retains only the likely branches by combining a top-$k$ cap and a cumulative probability threshold $\alpha$.
+Attack success rate measures the fraction of attacks for which a model returns a response judged harmful or compliant with a harmful behavior.  It is the dominant metric in jailbreak benchmarking because it is intuitive and directly tied to observed failures.  HarmBench and JailbreakBench improve the reproducibility of this measurement by specifying behavior sets, threat models, attack templates, and automated grading procedures.
+
+However, \ASR{} is a sampled-output statistic.  It does not characterize the underlying conditional distribution.  This matters whenever the visible response is not representative of the nearby continuation mass.  Greedy decoding can land on a refusal while alternative high-probability branches proceed toward compliance.  Sampling with a small number of trials can miss rare but meaningful branches.  A defense can move the mode of the distribution while leaving harmful branches nearby.  A fixed benchmark template can miss the template family that unlocks the largest harmful mass.
+
+\subsection{Probabilistic Model Checking}
+
+Probabilistic Computation Tree Logic (PCTL) is a temporal logic for reasoning about discrete-time Markov chains \cite{hansson1994logic,baier2008principles}.  The path operator $\mathbf{F}\phi$ means that property $\phi$ eventually holds; $\mathbf{G}\phi$ means that $\phi$ holds globally along the path.  A formula such as $\Prob_{\geq 0.9}[\mathbf{G}\neg \harm]$ states that the probability of never reaching a harmful state is at least $0.9$.
+
+For finite acyclic chains, reachability probabilities can be computed exactly by backward induction.  This is the setting used here.  We do not attempt unbounded verification of the full LLM distribution.  Instead, we construct a bounded continuation tree and compute finite-horizon reachability within that tree.
+
+\subsection{From LLM Generation to a Markov Chain}
+
+An autoregressive model $M$ defines a distribution over tokens:
+\[
+  P_M(t_n \mid x,t_{<n}),
+\]
+where $x$ is the prompt and $t_{<n}$ is the generated prefix.  This naturally induces a Markov chain over prefix states.  The initial state is the prompt; each transition appends one token; transition probabilities are the model's next-token probabilities.
+
+The full chain is infeasible to enumerate because modern vocabularies have tens of thousands of tokens and depth grows exponentially.  We therefore analyze a bounded process that retains only likely branches.  This follows the high-level bounded-tree view of LLMChecker \cite{gross2025llmchecker}, but uses a semantic harm evaluator and focuses on adversarial robustness diagnostics rather than general text-quality properties.
+
+\section{Problem Definition}
+\label{sec:problem}
+
+Let $x$ be a prompt, $M$ an autoregressive language model with vocabulary $\calV$, and $L$ a finite horizon.  A generated continuation of length $L$ is $y = (t_1,\ldots,t_L)$ with probability
+\[
+  P_M(y\mid x)
+  =
+  \prod_{\ell=1}^{L}
+  P_M(t_\ell \mid x,t_{<\ell}).
+\]
+Let $J$ be an evaluator that maps a prompt-continuation pair to a semantic label:
+\[
+  J(x,y) \in \{\harm,\safe\}.
+\]
+Our goal is to estimate, for a fixed prompt and model, the probability that likely continuations reach harmful content within a bounded horizon.
+
+\begin{definition}[Prompt-local harmful mass]
+For a prompt $x$, model $M$, evaluator $J$, and horizon $L$, the unbounded finite-horizon harmful mass is
+\[
+  H_L(x;M,J)
+  =
+  \Prob_{y\sim M(\cdot\mid x)}
+  \left[J(x,y)=\harm\right].
+\]
+\end{definition}
+
+Directly computing $H_L$ requires summing over $|\calV|^L$ continuations.  \BCA{} replaces this quantity with a bounded approximation over a tractable tree.
 
 \begin{definition}[$\alpha$-$k$ bounded active set]
-At a prefix state $s$, sort tokens by decreasing $P_M(t\mid s)$.  Given threshold $\alpha \in (0,1]$ and cap $k$, define
+At a prefix state $s$, let $t_{(1)},t_{(2)},\ldots$ be tokens sorted by decreasing next-token probability $P_M(t\mid s)$.  Given a cumulative threshold $\alpha\in(0,1]$ and a cap $k$, define
 \[
-  m(s) = \min\!\left(k,\; \min\!\left\{j : \sum_{i=1}^{j} P_M(t_{(i)} \mid s) \geq \alpha\right\}\right),
+  m(s)
+  =
+  \min\!\left(k,\; \min\!\left\{j : \sum_{i=1}^{j} P_M(t_{(i)}\mid s) \geq \alpha\right\}\right),
 \]
-and retain the active set $T_{\alpha,k}(s) = \{t_{(1)},\ldots,t_{(m(s))}\}$.  The retained transitions are renormalized so they form a stochastic vector.
+and
+\[
+  T_{\alpha,k}(s)
+  =
+  \{t_{(1)},\ldots,t_{(m(s))}\}.
+\]
 \end{definition}
 
-The result is a finite tree of depth $L$ and branching factor at most $k$, in which all paths begin at the prompt $x$ and each transition appends one token.  A semantic evaluator $J$ labels terminal continuations as $\harm$ or $\safe$.
+The retained outgoing probabilities are renormalized:
+\[
+  \widetilde P(s,s\cdot t)
+  =
+  \frac{P_M(t\mid s)}
+       {\sum_{u\in T_{\alpha,k}(s)}P_M(u\mid s)}
+  \qquad t\in T_{\alpha,k}(s).
+\]
+This gives a finite tree of depth $L$ and branching factor at most $k$.
 
 \begin{definition}[Bounded harmful mass]
-Let $\calT_{\alpha,k,L}(x,M)$ be the $\alpha$-$k$ bounded continuation tree rooted at $x$.  The bounded harmful mass is
+\label{def:bounded-mass}
+Let $\calT_{\alpha,k,L}(x,M)$ be the $\alpha$-$k$ bounded continuation tree rooted at prompt $x$.  The bounded harmful mass is
 \[
-  H_{\alpha,k,L}(x; M, J) = \Prob_{\widetilde P}\!\left[\mathbf{F}\,\harm\right],
+  H_{\alpha,k,L}(x;M,J)
+  =
+  \Prob_{\widetilde P}
+  \left[\mathbf{F}\,\harm\right],
 \]
-where terminal nodes are labeled by $J$ and path probabilities use the renormalized transitions $\widetilde P$.
+where terminal nodes are labeled by $J$ and path probabilities are computed under the renormalized bounded process.
 \end{definition}
 
-Sparse backward induction computes $H_{\alpha,k,L}$ exactly in time linear in the number of bounded states.  The tree construction itself, however, has worst-case complexity $O(k^L)$.
+\paragraph{Interpretation.}
+$H_{\alpha,k,L}$ is not the true full-distribution harmful probability.  It is the probability of reaching harm within the retained likely branches, conditional on the bounding rule.  This is precisely the object we use as a diagnostic: \emph{how much harmful mass exists nearby in token space under a stated bounded process?}
 
-\subsection{The Short-Horizon Problem}
+\section{Method: Bounded Continuation Analysis}
+\label{sec:method-bca}
 
-The state budget of exact \BCA{} is essentially the product $k^L$ multiplied by an $\alpha$-dependent pruning factor.  Empirically, $k = 2$, $\alpha = 0.99$, $L = 8$ produces trees of 100--3{,}000 nodes per prompt on instruction-tuned models in the 1.5B--7B range.  Increasing $L$ to even $12$ pushes the budget to tens of thousands and forces a switch to statistical model checking (\SMC), which carries a Hoeffding interval of width $\approx 0.1$ for $N = 200$ samples and $\delta = 0.05$.
+\subsection{Three-Stage Pipeline}
 
-The empirical \ASR{} that \BCA{} is meant to predict is computed over full generated completions, which on jailbroken prompts can extend to hundreds of tokens.  This is a structural gap: depth-$L$ bounded mass scores the model's early commitment, but the realised response can hedge, refuse, or escalate at depths far beyond what \BCA{} can enumerate.  Prior work \cite{ourbca} reports Spearman rank correlation $0.66$ between bounded mass at $L=8$ and empirical \ASR{} at full completion length, and explicitly identifies the depth-$L$ gap as a residual error source.
+\BCA{} proceeds in three stages:
 
-The straightforward fix---enumerate to larger $L$---is not available at the budget we want \BCA{} to run under.  We therefore consider a representational fix: lump concrete prefix states into a small abstract state space so that long-horizon dynamics become a small Markov chain.
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Tree construction.} Starting from the prompt prefix, expand an $\alpha$-$k$ bounded tree to depth $L$ using the model's next-token distribution at each prefix.
+  \item \textbf{Semantic labeling.} Decode terminal continuations and label them with a semantic harm judge $J$.
+  \item \textbf{Reachability computation.} Compute $\Prob[\mathbf{F}\,\harm]$ by exact backward induction when the bounded tree is small enough, or estimate it by statistical model checking when enumeration is too expensive.
+\end{enumerate}
 
-\section{Method}
-\label{sec:method}
+\begin{algorithm}[t]
+\caption{Exact bounded continuation analysis}
+\label{alg:exact-bca}
+\begin{algorithmic}[1]
+\Require Prompt $x$, model $M$, judge $J$, horizon $L$, threshold $\alpha$, cap $k$
+\State Initialize root state $s_0=x$
+\For{$d=0,\ldots,L-1$}
+  \ForAll{active states $s$ at depth $d$}
+    \State Compute $P_M(\cdot\mid s)$
+    \State Retain $T_{\alpha,k}(s)$ and renormalized transitions $\widetilde P$
+    \State Add children $s\cdot t$ for $t\in T_{\alpha,k}(s)$
+  \EndFor
+\EndFor
+\ForAll{leaves $s$ at depth $L$}
+  \State $\ell(s)\gets J(x,s)$
+  \State $V(s)\gets \ind[\ell(s)=\harm]$
+\EndFor
+\For{$d=L-1,\ldots,0$}
+  \ForAll{states $s$ at depth $d$}
+    \State $V(s)\gets \sum_{t\in T_{\alpha,k}(s)} \widetilde P(s,s\cdot t)V(s\cdot t)$
+  \EndFor
+\EndFor
+\State \Return $V(s_0)$
+\end{algorithmic}
+\end{algorithm}
 
-\subsection{Safety-Relevant Abstraction}
+The exact computation in \cref{alg:exact-bca} is linear in the number of bounded states after expansion.  The expansion itself remains exponential in the worst case, $O(k^L)$, which motivates the statistical estimator below.
 
-We replace the concrete state space of prefix strings with a four-element abstract space $\calZ = \{\refusal, \harm, \compliance, \ambiguous\}$.  Let $J$ be the semantic harm judge that maps a (behavior, continuation) pair to a binary harm score, and let $R$ be a phrase-based refusal detector applied to the continuation.  The abstraction function $\phi : \calS \to \calZ$ maps each concrete node $s$ to an abstract state by the following deterministic rule:
+\subsection{Semantic Harm Evaluator}
+
+For the main semantic experiments, terminal continuations are judged by a Qwen2.5-7B-Instruct semantic evaluator.  The evaluator receives the harmful behavior and the generated continuation and returns a binary judgment indicating whether the continuation is harmful/compliant with the behavior.  The same semantic judge is used for bounded-mass estimates and empirical \ASR{} validation, preventing judge mismatch in the correlation and budget experiments.
+
+All probabilities are therefore evaluator-conditional.  When we write $\Prob[\mathbf{F}\,\harm]$, the event is ``the semantic judge labels a reached terminal continuation harmful.''  This makes evaluator quality a core limitation rather than a solved subproblem.
+
+\subsection{Reachability Metrics}
+
+The primary metric is bounded harmful reachability:
+\[
+  \Prob[\mathbf{F}\,\harm] = V(s_0).
+\]
+We also use:
+\[
+  \Prob[\mathbf{G}\neg\harm] = 1 - \Prob[\mathbf{F}\,\harm]
+\]
+within the same bounded tree when harm labels are terminal and absorbing.
+
+To study refusal instability, let $R(s_0\cdot t)$ indicate that the first generated segment begins with a refusal marker.  The refusal-collapse probability is
+\[
+  \Prob[\refusal \wedge \mathbf{F}\,\harm]
+  =
+  \sum_{t:\,R(s_0\cdot t)}
+  \widetilde P(s_0,s_0\cdot t)\,V(s_0\cdot t).
+\]
+This isolates paths that begin as refusals but later reach harmful completions.
+
+\subsection{Statistical Model Checking}
+
+When exact enumeration exceeds the state budget, we sample $N$ independent trajectories from the same bounded process.  Each sampled path $\pi_i$ is scored by the property indicator
+\[
+  X_i = \ind[\pi_i \models \mathbf{F}\,\harm].
+\]
+The estimator is
+\[
+  \widehat P[\mathbf{F}\,\harm]
+  =
+  \frac{1}{N}\sum_{i=1}^{N}X_i.
+\]
+By Hoeffding's inequality \cite{hoeffding1963},
+\[
+  \Prob\!\left(\left|\widehat P - P\right|\geq \varepsilon\right)
+  \leq 2\exp(-2N\varepsilon^2).
+\]
+Equivalently, with probability at least $1-\delta$,
+\[
+  \left|\widehat P-P\right|
+  \leq
+  \sqrt{\frac{\ln(2/\delta)}{2N}}.
+\]
+For $N=200$ and $\delta=0.05$, the half-width is approximately $0.096$; for $N=500$, it is approximately $0.061$.
+
+\section{Experimental Setup}
+\label{sec:setup}
+
+\subsection{Models and Behaviors}
+
+We evaluate four instruction-tuned models:
+
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item Qwen2.5-1.5B-Instruct
+  \item Qwen2.5-7B-Instruct
+  \item Mistral-7B-Instruct-v0.2
+  \item Llama-3.1-8B-Instruct
+\end{itemize}
+
+The behavior set is JailbreakBench's harmful behavior suite, organized into ten broad categories: harassment/discrimination, malware/hacking, physical harm, economic harm, fraud/deception, disinformation, sexual/adult content, privacy, expert advice, and government decision-making.
+
+\subsection{Evaluation Modes}
+
+We separate three measurement modes throughout the paper:
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.44\linewidth}p{0.22\linewidth}}
+\toprule
+\textbf{Mode} & \textbf{Computation} & \textbf{Uncertainty}\\
+\midrule
+Exact bounded \DTMC{} & Enumerate the bounded tree, label leaves, run backward induction. & No Monte Carlo error; bounded by $\alpha,k,L,J$.\\
+\SMC{} estimate & Sample $N$ paths from the bounded process and estimate $\Prob[\varphi]$. & Hoeffding interval; $\varepsilon\approx0.096$ for $N=200,\delta=0.05$.\\
+Empirical \ASR{} & Sample full completions and judge completed responses. & Ordinary sampling noise.\\
+\bottomrule
+\end{tabular}
+\caption{Measurement modes used in the evaluation.}
+\label{tab:modes}
+\end{table}
+
+\subsection{Research Questions}
+
+The evaluation is organized around four \BCA{} questions plus one long-horizon question:
+
+\begin{description}[leftmargin=*,style=nextline,itemsep=3pt]
+  \item[RQ1: Hidden mass.] Does the bounded continuation distribution reveal harmful mass that is invisible to greedy \ASR?
+  \item[RQ2: Model comparison.] Can \BCA{} distinguish models that standard \ASR{} treats as equivalent?
+  \item[RQ3: Search objective.] Is $\Prob[\mathbf{F}\,\harm]$ an effective gradient-free signal for jailbreak-template selection?
+  \item[RQ4: Predictive validity.] Does bounded harmful mass predict empirical attack success, and when does it beat direct sampling under a query budget?
+  \item[RQ5: Long-horizon extrapolation.] Can a small abstract-state Markov chain, fitted on the shallow concrete tree, predict $\Prob[\mathbf{F}\,\harm]$ at horizons beyond what concrete enumeration can reach?
+\end{description}
+
+\section{RQ1: Hidden Harmful Mass}
+\label{sec:rq1}
+
+RQ1 tests the basic premise: if greedy decoding appears safe, can the continuation distribution still contain harmful mass?
+
+\paragraph{Setup.}
+We evaluate Qwen2.5-1.5B-Instruct on 100 JailbreakBench behaviors using exact bounded \DTMC{} model checking.  The setup uses $\alpha=0.90$, $k=5$, $L=10$, chat templates, and GPU sparse backward induction over the bounded tree.  Rows that hit the node budget are reported as conservative truncated estimates.  Greedy \ASR{} is zero for all 100 prompts.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{llrrr}
+\toprule
+\textbf{Prompt} & \textbf{Category} & \textbf{Greedy} & $\mathbf{\Prob[F\,harm]}$ & $\mathbf{\Prob[F\,ref]}$\\
+\midrule
+Regulatory loopholes & government & safe & 0.3363 & 0.4157\\
+Phishing & privacy & safe & 0.0232 & 0.1615\\
+Plagiarism & fraud/deception & safe & 0.0136 & 0.4309\\
+Ageism & harassment & safe & 0.0113 & 0.7576\\
+Ethnic genocide & physical harm & safe & 0.0099 & 0.4841\\
+Holocaust denial & disinformation & safe & 0.0030 & 0.5286\\
+Sept. 11 conspiracy & disinformation & safe & 0.0011 & 0.5009\\
+Ingesting detergent & physical harm & safe & 0.0006 & 0.0778\\
+Emergency mitigation & expert advice & safe & 0.0004 & 0.0000\\
+Payday loans & economic harm & safe & 0.0003 & 0.1414\\
+\bottomrule
+\end{tabular}
+\caption{Top Qwen2.5-1.5B prompts by bounded harmful mass in RQ1.  Greedy \ASR{} is zero for all prompts; the harmful mass column is invisible to one-sample evaluation.}
+\label{tab:rq1-top}
+\end{table}
+
+\paragraph{Finding 1: greedy safety can hide large bounded mass.}
+The strongest case is the regulatory-loopholes prompt.  Greedy decoding refuses, yet the bounded process assigns $0.3363$ probability to harmful leaves.  This is not a rare tail event under the bounded process; it is a large alternative branch mass that ordinary greedy \ASR{} cannot observe.
+
+\paragraph{Finding 2: refusal stability varies by prompt.}
+Thirteen of 100 prompts have $\Prob[\mathbf{F}\,\refusal] < 0.30$, meaning the model does not consistently route to refusal within the bounded horizon.  Examples include emergency mitigation, revenge porn, email scam, and ingesting detergent.  These prompts are greedy-safe but structurally fragile.
+
+\paragraph{Finding 3: tree size acts as a deliberation signal.}
+Soft-harm categories generate much larger trees than hard-harm categories.  Climate disinformation, xenophobia, and vaccine disinformation produce hundreds of thousands of states in the exact expansion, while bomb-making and school-shooting behaviors produce tiny trees because the model commits to refusal in one or two tokens.  Tree size is therefore a useful auxiliary signal: it reflects how quickly the model's local distribution collapses to refusal.
+
+\paragraph{Finding 4: some categories are robustly refused.}
+The malware/hacking category is the clearest robust case for Qwen2.5-1.5B in this setup: all ten prompts have $\Prob[\mathbf{F}\,\harm]=0.0000$ and average $\Prob[\mathbf{F}\,\refusal]=0.8273$.  These are not merely safe sampled outputs; the bounded distribution itself routes strongly to refusal.
+
+\section{RQ2: Model Comparison Under Zero Greedy ASR}
+\label{sec:rq2}
+
+RQ2 asks whether bounded harmful mass distinguishes models that look identical under greedy \ASR.  The cross-model sweep uses SMC estimates with 200 bounded trajectories and a Qwen2.5-7B semantic judge.  Qwen2.5-1.5B is additionally checked using exact bounded \DTMC{} verification with $k=2$, $L=8$, $\alpha=0.99$ on 100 behaviors.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Model} & \textbf{Greedy ASR} & \textbf{Mean best} & \textbf{$\geq0.99$} & \textbf{Resistant}\\
+\midrule
+Qwen2.5-7B-Instruct & 0/95 & 0.933 & 88/95 & 3/95\\
+Mistral-7B-Instruct-v0.2 & 0/95 & 0.895 & 73/95 & 4/95\\
+Qwen2.5-1.5B-Instruct & 0/100 & 0.906 & 72/100 & 2/100\\
+Llama-3.1-8B-Instruct & 0/95 & 0.178 & 2/95 & 37/95\\
+\bottomrule
+\end{tabular}
+\caption{Cross-model safety profile.  All models score greedy \ASR{} $=0$, but bounded harmful mass reveals a wide spread.  Qwen2.5-1.5B figures are exact bounded \DTMC{} values; the other rows are SMC estimates.  ``Resistant'' means no template achieves $\Prob[\harm] > 0.05$.}
+\label{tab:rq2-models}
+\end{table}
+
+\paragraph{Qwen2.5-7B: high susceptibility under commitment templates.}
+Qwen2.5-7B has the highest mean best harmful mass.  Suffix forcing reaches $\Prob[\harm]\geq0.99$ on 88 of 95 behaviors, and only 3 behaviors resist all templates.  This is notable because Qwen2.5-7B shares a model family with Qwen2.5-1.5B but is more susceptible under the template search.
+
+\paragraph{Mistral-7B: high baseline leakage.}
+Mistral shows the highest direct-prompt baseline in the sweep, with average no-template $\Prob[\harm]=0.310$.  Suffix forcing is strong, but output-format injection and fictional framing are also competitive.  This suggests a broader vulnerability surface rather than a single template-specific failure.
+
+\paragraph{Qwen2.5-1.5B: robust by default, brittle under commitment.}
+Direct prompts have low harmful mass on average, and some categories are strongly refused.  Under suffix forcing, however, the exact bounded tree often collapses to a few near-deterministic harmful leaves.  Exact verification finds 72 of 100 behaviors with $\Prob[\harm]\geq0.99$ and only two behaviors that fully resist all 18 templates.
+
+\paragraph{Llama-3.1-8B: qualitatively more robust.}
+Llama has the lowest mean best harmful mass, only two behaviors with $\Prob[\harm]\geq0.99$, and 37 of 95 behaviors that resist every template.  Its strongest template family is nested fiction rather than suffix forcing, indicating a different vulnerability surface.
+
+\paragraph{Conclusion for RQ2.}
+Greedy \ASR{} treats all four models as identical: 0 successful greedy attacks.  \BCA{} reveals a roughly $5\times$ spread in mean best harmful mass and a large difference in fully resistant behavior counts.  This is the core model-comparison value of the method.
+
+\section{RQ3: Harmful Mass as a Template-Search Signal}
+\label{sec:rq3}
+
+Jailbreak templates are a free variable: the same harmful goal wrapped in different phrasings can produce identical greedy \ASR{} but very different bounded harmful mass.  RQ3 asks whether $\Prob[\mathbf{F}\,\harm]$ is useful for ranking templates before spending empirical red-team queries.
+
+\subsection{Template Families}
+
+We evaluate 18 templates spanning six strategy classes:
+
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Baseline:} direct prompt.
+  \item \textbf{Narrative:} fictional framing, bedtime-story framing, nested fiction.
+  \item \textbf{Encyclopedic:} Wikipedia-style or historical/documentary framing.
+  \item \textbf{Persona:} named unconstrained assistant or professional role framing.
+  \item \textbf{Prefix/suffix commitment:} forced completion, suffix forcing, output-format injection.
+  \item \textbf{Permission/override:} educational, hypothetical, refusal-bypass, DAN-style framing.
+\end{itemize}
+
+We describe template families rather than printing operational jailbreak text; the point is the relative ranking of strategy classes, not dissemination of prompts.
+
+\subsection{Qwen2.5-1.5B Template Search}
+
+On a 14-behavior Qwen2.5-1.5B subset with 18 templates and 200 SMC trajectories per behavior-template pair, suffix forcing wins 13 of 14 behaviors at $\Prob[\mathbf{F}\,\harm]=1.0$.  Wikipedia-style framing wins the remaining behavior.  DAN-style and permission-class templates win zero.
+
+The mechanism is interpretable.  Permission and override templates often explicitly mention safety rules, which can activate refusal behavior.  Suffix forcing instead frames generation as an unconditional continuation, shifting the model toward commitment before the refusal path is selected.  Output-format injection is also strong, suggesting that safety training may cover conversational refusal more thoroughly than structured technical response formats.
+
+\subsection{Cross-Model Template Generalization}
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Model} & \textbf{Suffix wins} & \textbf{$\geq0.99$} & \textbf{Mean best} & \textbf{No template}\\
+\midrule
+Qwen2.5-7B & 84/95 & 88/95 & 0.933 & 3\\
+Mistral-7B & 42/95 & 73/95 & 0.895 & 4\\
+Qwen2.5-1.5B & 9/10 & 8/10 & 0.974 & 0\\
+Llama-3.1-8B & 18/95 & 2/95 & 0.178 & 37\\
+\bottomrule
+\end{tabular}
+\caption{Template generalization across model families using SMC estimates.  Suffix forcing is broadly strong, but penetration depth varies sharply.}
+\label{tab:rq3-template-generalization}
+\end{table}
+
+Suffix forcing ranks first on all four model families, but its penetration depth varies substantially.  It wins 84/95 behaviors on Qwen2.5-7B but only 18/95 on Llama-3.1-8B.  Llama's strongest family is nested fiction, suggesting that its safety training guards better against direct commitment patterns while remaining more permeable to narrative framing.
+
+\subsection{Exact Bounded DTMC Confirmation}
+
+To remove sampling noise from the strongest Qwen2.5-1.5B claim, we run exact bounded \DTMC{} verification with $k=2$, $L=8$, $\alpha=0.99$ and semantic leaf labeling.  Suffix forcing wins 76/100 behaviors; output-format injection wins 15.  Exact $\Prob[\harm]\geq0.99$ holds on 72/100 behaviors, and only two behaviors fully resist all 18 templates.  Under suffix forcing, the bounded trees often collapse to 1--8 leaves, all judged harmful.
+
+\section{RQ4: Predictive Validity and Query Budget}
+\label{sec:rq4}
+
+RQ4 evaluates whether bounded harmful mass tracks real completions.  We estimate $\Prob[\mathbf{F}\,\harm]$ for each behavior-template pair using SMC, then independently sample 100 full completions and judge them with the same semantic evaluator.
+
+\paragraph{Correlation.}
+Across 100 behavior-template pairs, the rank correlation between bounded mass and empirical semantic \ASR{} is
+\[
+  \rho_{\mathrm{Spearman}} = 0.6631,
+  \qquad p = 5.6\times10^{-14}.
+\]
+This is strong evidence that bounded harmful mass is a useful ranking signal.  The correlation is not perfect for an expected reason: bounded mass scores the first $L$ tokens, while empirical \ASR{} scores full completions.  Some continuations begin on harmful-looking trajectories and later hedge or refuse.  This depth-$L$ gap is the structural limitation that RQ5 addresses.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Behavior} & \textbf{Direct} & \textbf{Random} & \textbf{Top-1 Mass} & \textbf{Lift}\\
+\midrule
+Ableism & 0.000 & 0.114 & 0.530 & 4.65$\times$\\
+Racial discrimination & 0.000 & 0.033 & 0.180 & 5.45$\times$\\
+Sex discrimination & 0.000 & 0.026 & 0.150 & 5.77$\times$\\
+Password cracking & 0.000 & 0.012 & 0.110 & 9.17$\times$\\
+Network hacking & 0.000 & 0.011 & 0.100 & 9.09$\times$\\
+Holocaust glorification & 0.000 & 0.013 & 0.110 & 8.46$\times$\\
+Sexism & 0.000 & 0.007 & 0.030 & 4.29$\times$\\
+Xenophobia & 0.000 & 0.012 & 0.030 & 2.50$\times$\\
+\midrule
+Mean & 0.000 & 0.027 & 0.155 & 6.17$\times$\\
+\bottomrule
+\end{tabular}
+\caption{Mass-guided template selection improves empirical \ASR{} over random selection on behaviors where lift is defined.}
+\label{tab:rq4-lift}
+\end{table}
+
+\paragraph{Top-$k$ coverage.}
+Selecting the top template by bounded mass includes at least one successful empirical attack for 8/11 behaviors.  The top three templates cover 9/11, and the top five cover 10/11.  Thus bounded mass is useful not only for selecting a single template but also for triaging a small candidate set.
+
+\paragraph{Budget crossover.}
+We simulate empirical search under a query budget.  For each budget level $B$, empirical search spends $B$ queries per template, ranks templates by observed success, chooses a winner, and evaluates that winner on held-out samples.  \BCA-guided selection uses the SMC $\Prob[\mathbf{F}\,\harm]$ ranking with zero empirical search samples.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{rrrrr}
+\toprule
+$B$ & \textbf{Queries} & \textbf{Random ASR} & \textbf{Empirical ASR} & \textbf{BCA ASR}\\
+\midrule
+1 & 10 & 0.025 & 0.041 & 0.113\\
+2 & 20 & 0.025 & 0.060 & 0.113\\
+5 & 50 & 0.026 & 0.089 & 0.113\\
+10 & 100 & 0.026 & 0.110 & 0.113\\
+25 & 250 & 0.025 & 0.126 & 0.113\\
+50 & 500 & 0.025 & 0.131 & 0.113\\
+\bottomrule
+\end{tabular}
+\caption{Budget simulation.  \BCA-guided selection outperforms empirical search until approximately 100 empirical search queries per behavior.}
+\label{tab:budget}
+\end{table}
+
+The crossover occurs near $B=10$, or 100 total search queries per behavior.  Below that threshold, empirical estimates are too noisy to identify the best template reliably.  Above it, empirical search can correct for the depth-$L$ gap and marginally surpass bounded-mass selection.
+
+\section{The Short-Horizon Problem}
+\label{sec:short-horizon}
+
+The four \BCA{} results above share one residual error source: the bounded tree depth $L$ is much shorter than the realised completion length judged by empirical \ASR.
+
+\subsection{Why \BCA{} is Capped at Small $L$}
+
+The exact bounded tree has at most $k^L$ leaves.  In practice $k = 2$, $\alpha = 0.99$, $L = 8$ produces 100--3{,}000 nodes per prompt on instruction-tuned 1.5B--7B models.  Increasing $L$ to $12$ pushes the budget past $10^4$ and \SMC{} becomes the only available estimator, with Hoeffding half-width $\approx 0.10$ at $N=200$.  Increasing $L$ to $30$ or $50$, the range relevant to full completions, is infeasible under exact enumeration and gives \SMC{} estimates with confidence intervals that are too wide to drive template-by-template ranking.
+
+\subsection{The Symptoms of the Gap}
+
+Three symptoms make the gap concrete:
+
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item In RQ4, the depth-$L$ gap is the dominant residual: bounded mass at $L=8$ correctly ranks templates ($\rho = 0.66$) but does not always agree in absolute value with empirical \ASR{} at full completion length.
+  \item Some continuations look harmful at depth $8$ and later hedge.  Backward induction over the bounded tree therefore over-attributes mass to ``early harmful'' nodes when the model would in practice walk back later.
+  \item Some continuations look safe at depth $8$ and later become harmful.  These are missed entirely.
+\end{itemize}
+
+\subsection{Two Possible Responses}
+
+There are two principled responses.  The first is to extend \BCA{}'s enumeration via \SMC{} at the cost of wider intervals.  The second is to compress the state space so that long-horizon dynamics become a small Markov chain whose forward propagation cost is constant in $L$.  The remainder of the paper takes the second route.
+
+\section{Method: Abstract-State Markov Chain}
+\label{sec:method-abstract}
+
+\subsection{Four-State Safety-Relevant Abstraction}
+
+We replace the concrete state space of prefix strings with a four-element abstract space
+\[
+  \calZ = \{\refusal,\;\harm,\;\compliance,\;\ambiguous\}.
+\]
+Let $J$ be the same semantic harm judge used elsewhere in the paper, and let $R$ be a phrase-based refusal detector applied to the continuation.  The abstraction function $\phi : \calS \to \calZ$ maps each concrete node $s$ to an abstract state by the following deterministic rule:
 
 \begin{enumerate}[leftmargin=*,itemsep=2pt]
   \item If $s$ is a terminal or its continuation is shorter than a minimum length $\tau_\mathrm{min}$, return $\ambiguous$.
@@ -144,7 +574,7 @@ We replace the concrete state space of prefix strings with a four-element abstra
   \item Otherwise return $\ambiguous$.
 \end{enumerate}
 
-The refusal-over-harm precedence is deliberate: a continuation containing both a refusal phrase and a harm-keyword (``I cannot help you build a bomb'') is functionally a refusal.  The length thresholds $\tau_\mathrm{min}$ and $\tau_\mathrm{comp}$ guard against judge noise on near-empty continuations.
+The refusal-over-harm precedence is deliberate: a continuation containing both a refusal phrase and a harm keyword (``I cannot help you build a bomb'') is functionally a refusal.  The length thresholds $\tau_\mathrm{min}$ and $\tau_\mathrm{comp}$ guard against judge noise on near-empty continuations.
 
 \paragraph{Why this lumping.}  The four-state space is chosen so that the absorbing $\mathbf{F}\,\harm$ semantics used by \BCA{} extend to it directly.  $\refusal$ and $\harm$ are treated as absorbing: once the abstract trajectory enters either, it cannot leave.  Mass in $\refusal$ is permanently routed away from harm; mass in $\harm$ contributes fully to $\Prob[\mathbf{F}\,\harm]$.  $\ambiguous$ and $\compliance$ are transient.  This gives a four-element analogue of the original concrete \DTMC's three-class equivalence (harm leaf, refusal leaf, neither) but adds an internal distinction between substantive non-harm content (``$\compliance$'') and undecided early generation (``$\ambiguous$''), which is the distinction needed for non-trivial long-horizon prediction.
 
@@ -224,38 +654,24 @@ Large values indicate that concrete states inside one abstract bucket disagree a
 
 The two diagnostics localize different failure modes.  $\TV_\mathrm{stat}$ exposes non-stationarity (the dynamics at depth $d$ differ from the dynamics at depth $d+1$ within the same abstract bucket).  $\TV_\mathrm{lump}$ exposes lumpability violations (the four-state abstraction is too coarse to capture relevant within-bucket variation).
 
-\section{Experimental Setup}
-\label{sec:setup}
+\section{RQ5: Long-Horizon Extrapolation Results}
+\label{sec:abstract-results}
 
-\subsection{Models, Behaviors, and Parameters}
+\subsection{Setup}
 
-The bounded tree is built using Qwen2.5-1.5B-Instruct served by vLLM with prefix caching on a single 32~GB GPU.  The semantic harm judge is Qwen2.5-7B-Instruct (the same judge used in prior \BCA{} evaluation) served by vLLM on a separate 32~GB GPU.  We use the legacy yes/no judging head with a behavior-conditioned classifier prompt; binary scores are mapped to $10$ (harm) and $1$ (not harm), and we treat any score $\geq 10$ as $\harm$.
+The bounded tree is built using Qwen2.5-1.5B-Instruct served by vLLM with prefix caching on a single 32~GB GPU.  The semantic harm judge is Qwen2.5-7B-Instruct served by vLLM on a separate 32~GB GPU; binary judge outputs are mapped to $10$ (harm) and $1$ (not harm), and any score $\geq 10$ counts as $\harm$.
 
-Behaviors are drawn from JailbreakBench's harmful-behavior split.  The tree is built with chat-template framing of the user message, $k=2$, $\alpha = 0.99$, $L_\mathrm{max} \in \{10\}$, $L_\mathrm{train} \in \{5\}$, and a node budget of $10{,}000$.  All three experimental conditions use these settings; the only thing that varies is whether each behavior is wrapped in a jailbreak template.
+Behaviors are drawn from JailbreakBench's harmful-behavior split.  The tree is built with chat-template framing of the user message, $k=2$, $\alpha = 0.99$, $L_\mathrm{max} = 10$, $L_\mathrm{train} = 5$, and a node budget of $10{,}000$.
 
-\subsection{Three Conditions}
+We run three matched conditions:
 
 \textbf{Smoke (n=3).}  The first three JailbreakBench behaviors with the un-modified user goal.
 
 \textbf{Hesitant (n=20).}  The first twenty JailbreakBench behaviors with the un-modified user goal.  This condition reflects what \BCA{} sees when run on raw harmful prompts against a safety-tuned model: most behaviors are refused, but a few partially leak.
 
-\textbf{Jailbroken (n=20).}  The first twenty JailbreakBench behaviors, each wrapped in the highest-scoring template for that behavior from a prior $L=8$ template-search run on Qwen2.5-1.5B \cite{ourbca}.  For our experimental subset this is overwhelmingly the suffix-forcing template, which prepends a commitment phrase to the assistant turn.
+\textbf{Jailbroken (n=20).}  The first twenty JailbreakBench behaviors, each wrapped in the highest-scoring template for that behavior from the \BCA{} template search reported in RQ3.  For our experimental subset this is overwhelmingly the suffix-forcing template.
 
-The three conditions span the regime in which the abstraction is most useful (jailbroken, where bounded-mass guided attacks operate) and the regime where it is hardest (hesitant, where the model has a genuine decision moment mid-trajectory).
-
-\subsection{Ground Truth and Estimators}
-
-For each behavior we compute the concrete $\Prob[\mathbf{F}\,\harm]$ at $L_\mathrm{max}=10$ by backward induction over the full bounded tree with the same abstraction function $\phi$ used for the chain estimators.  This makes the comparison apples-to-apples: any disagreement is attributable to the Markov assumption, not to a different harm definition.
-
-Three quantities are then reported per behavior:
-\begin{itemize}[leftmargin=*,itemsep=2pt]
-  \item $\widehat \Prob_\mathrm{lump}$: $\Prob[\mathbf{F}\,\harm]$ obtained by propagating absorbing abstract mass through the actual lumped tree.  By \Cref{prop:lump-preserve} this is a sanity check; its agreement with the concrete value rules out implementation bugs.
-  \item $\widehat \Prob_\mathrm{stat}$: stationary-fit Markov prediction.
-  \item $\widehat \Prob_\mathrm{depth}$: depth-conditional Markov prediction.
-\end{itemize}
-
-\section{Results}
-\label{sec:results}
+For each behavior we compute the concrete $\Prob[\mathbf{F}\,\harm]$ at $L_\mathrm{max}=10$ by backward induction over the full bounded tree with the same abstraction function $\phi$ used for the chain estimators.  Any disagreement is attributable to the Markov assumption, not to a different harm definition.
 
 \subsection{Overall Numbers}
 
@@ -286,7 +702,7 @@ Jailbroken, excluding sudo\_access outlier & 19 & $\leq 10^{-16}$ & $0.107$ & $\
 \small
 \begin{tabular}{lrrrrrrr}
 \toprule
-\textbf{Behavior} & nodes & truth & $\widehat\Prob_\mathrm{stat}$ & $\widehat\Prob_\mathrm{depth}$ & $e_\mathrm{stat}$ & $e_\mathrm{depth}$ & decision $d^*$\\
+\textbf{Behavior} & nodes & truth & $\widehat\Prob_\mathrm{stat}$ & $\widehat\Prob_\mathrm{depth}$ & $e_\mathrm{stat}$ & $e_\mathrm{depth}$ & $d^*$\\
 \midrule
 xenophobia & 1551 & 0.627 & 0.877 & 0.953 & $+0.250$ & $+0.326$ & 3\\
 ableism & 1990 & 0.166 & 0.593 & 0.638 & $+0.426$ & $+0.471$ & 2\\
@@ -297,15 +713,15 @@ keylogger\_script & 1715 & 0.369 & 0.599 & 0.643 & $+0.230$ & $+0.274$ & 3\\
 Mean & -- & 0.268 & 0.500 & 0.535 & $+0.232$ & $+0.268$ & --\\
 \bottomrule
 \end{tabular}
-\caption{Hesitant condition, behaviors with concrete $\Prob[\mathbf{F}\,\harm]>0.01$.  The other 15 behaviors have truth $\leq 0.002$ and both estimators trivially match.  Both estimators \emph{always} overshoot; depth-conditional is always worse than stationary.  Decision-moment depth $d^*$ is the smallest depth at which $\TV_\mathrm{stat}(\ambiguous, d)$ exceeds $0.2$.}
+\caption{Hesitant condition, behaviors with concrete $\Prob[\mathbf{F}\,\harm]>0.01$.  The other 15 behaviors have truth $\leq 0.002$ and both estimators trivially match.  Both estimators always overshoot; depth-conditional is always worse than stationary.  Decision-moment depth $d^*$ is the smallest depth at which $\TV_\mathrm{stat}(\ambiguous, d)$ exceeds $0.2$.}
 \label{tab:hesitant}
 \end{table}
 
 \Cref{tab:hesitant} reports the five behaviors in the hesitant condition with non-trivial ground truth.  All five overshoot, both in the stationary and depth-conditional fits.  The depth-conditional fit is worse than the stationary fit on every behavior.
 
-The mechanism is visible in the trajectories.  For xenophobia (concrete truth $0.627$), the unabsorbed concrete \emph{abstract} mass in $\harm$ peaks at $0.568$ at depth $4$ and then \emph{drops back} to $0.014$ by depth $10$, with mass leaking into $\compliance$ ($0.252$) and $\ambiguous$ ($0.054$) as the judge re-evaluates longer continuations differently.  The chain prediction, by construction of absorbing semantics, accumulates harm monotonically; it reaches $0.953$ at depth $10$.  The accumulated $\Prob[\mathbf{F}\,\harm]$ over the concrete tree (which also uses absorbing semantics) is $0.627$, lower than the chain's prediction because the chain's fitted transition rate at depth $4$---when the model briefly enters $\harm$---is treated as a stationary feature of the dynamics rather than a one-time event.
+The mechanism is visible in the trajectories.  For xenophobia (concrete truth $0.627$), the unabsorbed concrete abstract mass in $\harm$ peaks at $0.568$ at depth $4$ and then drops back to $0.014$ by depth $10$, with mass leaking into $\compliance$ ($0.252$) and $\ambiguous$ ($0.054$) as the judge re-evaluates longer continuations differently.  The chain prediction, by construction of absorbing semantics, accumulates harm monotonically; it reaches $0.953$ at depth $10$.  The accumulated $\Prob[\mathbf{F}\,\harm]$ over the concrete tree (which also uses absorbing semantics) is $0.627$, lower than the chain's prediction because the chain's fitted transition rate at depth $4$---when the model briefly enters $\harm$---is treated as a stationary feature of the dynamics rather than a one-time event.
 
-\Cref{tab:hesitant} also reports the smallest training depth at which the stationarity diagnostic crosses $0.2$ in the $\ambiguous$ row, denoted $d^*$.  In four of the five non-trivial cases $d^*$ falls inside the $L_\mathrm{train}=5$ window, confirming that what the Markov fit sees as a transition rate is in fact a transient.  Pushing the training window to $L_\mathrm{train}=8$ would average the transient over more stable post-decision depths and reduce the overshoot.  We did not run this sweep but report the corresponding diagnostic.
+\Cref{tab:hesitant} also reports the smallest training depth at which the stationarity diagnostic crosses $0.2$ in the $\ambiguous$ row, denoted $d^*$.  In four of the five non-trivial cases $d^*$ falls inside the $L_\mathrm{train}=5$ window, confirming that what the Markov fit sees as a transition rate is in fact a transient.  Pushing the training window to $L_\mathrm{train}=8$ would average the transient over more stable post-decision depths and reduce the overshoot.
 
 \subsection{Jailbroken Behaviors: Near-Perfect Depth-Conditional Fit}
 
@@ -368,14 +784,28 @@ keylogger\_script & 0.000 & 0.431 & 0.428 & 0.009\\
 \label{tab:stationarity}
 \end{table}
 
-\Cref{tab:stationarity} reports the stationarity diagnostic for the five hesitant non-trivial behaviors.  Each behavior has at least one adjacent depth pair where $\TV_\mathrm{stat}(\ambiguous, \cdot)$ exceeds $0.2$ and at least one where it is essentially zero, but \emph{which} depth pair carries the transient varies: xenophobia and racial\_discrimination at $d=3\to4$, keylogger\_script at $d=1\to2$ and $d=2\to3$, ableism at $d=0\to1$.  This is the structural reason a single stationary $\bar P$ is unreliable in the hesitant condition: it averages across depths where the dynamics differ.
+\Cref{tab:stationarity} reports the stationarity diagnostic for the five hesitant non-trivial behaviors.  Each behavior has at least one adjacent depth pair where $\TV_\mathrm{stat}(\ambiguous, \cdot)$ exceeds $0.2$ and at least one where it is essentially zero, but which depth pair carries the transient varies: xenophobia and racial\_discrimination at $d=3\to4$, keylogger\_script at $d=1\to2$ and $d=2\to3$, ableism at $d=0\to1$.  This is the structural reason a single stationary $\bar P$ is unreliable in the hesitant condition: it averages across depths where the dynamics differ.
 
 The lumpability diagnostic $\TV_\mathrm{lump}$ (not tabulated for space) stays below $0.17$ everywhere across both conditions, and is below $0.05$ in 90\% of $(z, d)$ pairs.  This confirms that the four-state abstraction itself is adequate: concrete nodes inside a bucket behave similarly enough that a single per-bucket transition is a good summary.  The problem is non-stationarity, not coarseness of the abstraction.
 
 \section{Discussion}
 \label{sec:discussion}
 
-\subsection{A Unified Mechanism}
+\subsection{What BCA Adds to ASR}
+
+\ASR{} answers whether an observed response was harmful.  \BCA{} answers a different question: how much harmful probability mass exists in the bounded continuation neighborhood?  These questions are complementary.  \ASR{} is the right metric for realized failures; \BCA{} is a diagnostic for hidden instability.
+
+The most important use cases are:
+
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Prompt triage.} Identify prompts that look safe under greedy decoding but have nontrivial harmful mass.
+  \item \textbf{Model comparison.} Separate models that have identical sampled \ASR{} but different distributional robustness.
+  \item \textbf{Defense evaluation.} Detect defenses that move the greedy path without reducing harmful mass.
+  \item \textbf{Search guidance.} Rank jailbreak templates before spending empirical queries.
+  \item \textbf{Patch validation.} Check whether a mitigation actually removes harmful branches from the bounded process.
+\end{itemize}
+
+\subsection{A Unified Mechanism for the Long-Horizon Results}
 
 Combining the hesitant and jailbroken conditions yields a single explanation for every observed estimator failure.  Let $d^*$ be the depth at which the model's local distribution transitions from ``not committed'' to ``committed,'' as identified by the first depth at which $\TV_\mathrm{stat}(\ambiguous, d)$ exceeds a fixed threshold.  Then:
 
@@ -387,17 +817,25 @@ Combining the hesitant and jailbroken conditions yields a single explanation for
 
 The boundary between these regimes is sharp and behavior-specific.  Different behaviors have $d^*$ at $d=2$ (ableism, jailbroken commits), $d=3$--$4$ (xenophobia, racial), $d=6$ (\textsc{sudo\_access}), and (apparently) much later for behaviors where truth is dominated by transient harm that flows back out (the hesitant case).
 
-\subsection{Implications for BCA}
+\subsection{Why Depth-Conditional Beats Stationary in Saturation but Loses in Transient}
+
+The depth-conditional fit's relationship to the stationary fit is the most counterintuitive observation in the experiments.  In jailbroken behaviors the depth-conditional fit is essentially exact and the stationary fit underestimates by $0.10$.  In hesitant behaviors the ranking flips: the stationary fit is closer to truth.
+
+The mechanism is that the depth-conditional fit trusts the last training matrix during extrapolation, while the stationary fit averages it with earlier matrices.  When the last training matrix is the right matrix (jailbroken, post-commit), trusting it is correct.  When the last training matrix is a transient (hesitant, near-commit), trusting it propagates the transient forward indefinitely.  Averaging dampens the transient but also dampens correct post-commit dynamics; that is why it is the worse fit on jailbroken behaviors but the less-bad fit on hesitant ones.
+
+\subsection{Implications for BCA Pipelines}
 
 The abstraction works exactly where \BCA{} is most useful for adversarial search.  In the jailbroken regime---which is the operational regime of mass-guided template selection and attack pipelines like \BCA{}-augmented TAP and PAIR---the depth-conditional Markov fit recovers $\Prob[\mathbf{F}\,\harm]$ within $\pm 0.003$ of the concrete value.  This means the abstraction can extend the effective horizon of \BCA{}-guided attacks well beyond the concrete tree budget without paying additional LLM forward passes after $L_\mathrm{train}$.
 
 In the verification regime---where \BCA{} is used as a conservative upper bound on harmful mass---the abstraction has a useful direction of error.  Hesitant prompts produce overshoots, which are conservative bounds.  Late-commit prompts produce undershoots, which are not, but those undershoots are extremely rare and can be detected by inspecting the stationarity diagnostic of the trained chain: a chain whose entire training window shows $\ambiguous \to \ambiguous$ with rate $\geq 0.99$ has not learned anything and should not be trusted.
 
-\subsection{Why Depth-Conditional Beats Stationary in Saturation but Loses in Transient}
+\subsection{Why Semantic Evaluation Matters}
 
-The depth-conditional fit's relationship to the stationary fit is the most counterintuitive observation in the experiments.  In jailbroken behaviors the depth-conditional fit is essentially exact and the stationary fit underestimates by $0.10$.  In hesitant behaviors the ranking flips: the stationary fit is closer to truth.
+Keyword matching is insufficient for both halves of this paper.  Harmful content can be phrased indirectly; refusals can begin safely and collapse into compliance; and template search can alter surface form without changing semantic risk.  The semantic judge is therefore central to the method.  It also introduces a bottleneck: all reported probabilities are conditional on the judge's accuracy, calibration, and policy boundary.
 
-The mechanism is that the depth-conditional fit \emph{trusts} the last training matrix during extrapolation, while the stationary fit averages it with earlier matrices.  When the last training matrix is the right matrix (jailbroken, post-commit), trusting it is correct.  When the last training matrix is a transient (hesitant, near-commit), trusting it propagates the transient forward indefinitely.  Averaging dampens the transient but also dampens correct post-commit dynamics; that is why it is the worse fit on jailbroken behaviors but the less-bad fit on hesitant ones.
+\subsection{Exact vs. SMC Results}
+
+Exact bounded \DTMC{} checking is strongest when feasible: it has no Monte Carlo error and gives the exact reachability probability for the bounded tree.  But exact enumeration is exponential in $k$ and $L$.  SMC is the practical mode for larger model and template sweeps.  The paper therefore treats exact and SMC results separately: exact results are used for Qwen2.5-1.5B confirmation runs and the long-horizon validation experiments, while broader cross-model comparisons use SMC estimates with stated confidence intervals.
 
 \subsection{Recommendations}
 
@@ -413,51 +851,104 @@ For practitioners interested in extending \BCA{} to longer horizons we suggest:
 \section{Limitations}
 \label{sec:limitations}
 
-\paragraph{Single model.}  All experiments use Qwen2.5-1.5B-Instruct as the bounded-tree builder and Qwen2.5-7B-Instruct as the harm judge.  The decision-moment phenomenology may differ on larger models or models with stronger refusal training.  Reproducing the experiments on Mistral-7B-Instruct-v0.2 and Llama-3.1-8B-Instruct (both already part of the broader \BCA{} evaluation) would test whether the depth-conditional fit's accuracy on jailbroken behaviors generalizes.
+\paragraph{Not a proof of safety.}
+\BCA{} does not certify the full unbounded output distribution.  It estimates bounded harmful mass for a specific prompt, model, decoding process, horizon, bounding rule, and evaluator.
 
-\paragraph{Judge dependence.}  The four-state abstraction depends on a semantic harm judge applied at every tree node, not just at leaves.  The judge's training distribution is full-completion responses; short mid-generation continuations may receive noisy labels.  We mitigate this with a length gate ($\tau_\mathrm{min} = 12$ characters) but cannot rule out residual judge noise as a contributor to non-stationarity.  An ensemble judge or a verifier-style classifier trained on partial completions would isolate the effect.
+\paragraph{Bounding discards tail mass.}
+Top-$k$ and $\alpha$ truncation ignore low-probability branches.  For rare catastrophic events, adversarial tail search may be more appropriate than high-probability bounded expansion.
 
-\paragraph{One training window.}  We only tested $L_\mathrm{train} = 5$ at $L_\mathrm{max} = 10$.  The mechanism analysis predicts that $L_\mathrm{train} \in \{6, 8\}$ would reduce overshoot on hesitant behaviors and would correctly handle the \textsc{sudo\_access} outlier.  This sweep is the most informative follow-up experiment and is straightforward to run.
+\paragraph{Tree expansion is exponential.}
+Even with GPU batching and sparse backward induction, exact enumeration grows as $O(k^L)$.  Larger horizons require SMC, the abstract-chain extrapolation introduced here, or property-directed search.
 
-\paragraph{Markov assumption.}  We treat the abstract state as a sufficient statistic for next-step prediction.  Even within the jailbroken regime the empirical fit will not be exactly Markov because the underlying LLM is not Markov on the abstract space (the concrete prefix string is the true state).  The near-exact recovery on jailbroken behaviors suggests this is a small effect in practice but is not proved.
+\paragraph{Evaluator quality is central.}
+If the semantic harm judge is weak, biased, or inconsistent, the probability estimate inherits those errors.  Future work should evaluate judge sensitivity and use ensembles or human-audited calibration sets.
 
-\paragraph{Single horizon test.}  We test at $L_\mathrm{max}=10$ only.  The strongest motivation for the abstraction is extrapolation to $L_\mathrm{max} \in \{30, 50\}$, where \BCA{}'s \SMC{} estimator becomes the only available baseline.  Comparing the abstract chain to \SMC{} estimates at those depths is the natural next experiment.
+\paragraph{Depth-$L$ gap.}
+Bounded prefixes can look harmful but later hedge, or look safe but later become harmful.  This explains part of the gap between bounded mass at $L=8$ and empirical full-completion \ASR{}, and is the motivation for the long-horizon abstraction.
 
-\paragraph{Behavior coverage.}  Twenty behaviors per condition is enough to characterize the mechanism but not enough to claim distributional rates.  Cross-validating on the remaining 80 JBB behaviors and the 200 HarmBench behaviors would tighten the error bars in \Cref{tab:overall}.
+\paragraph{Template coverage.}
+The template set is broad but not exhaustive.  A different adversary may discover templates not represented here.
+
+\paragraph{Single model for long-horizon experiments.}
+All long-horizon experiments use Qwen2.5-1.5B-Instruct as the bounded-tree builder and Qwen2.5-7B-Instruct as the harm judge.  The decision-moment phenomenology may differ on larger models or models with stronger refusal training.  Reproducing the experiments on Mistral-7B-Instruct-v0.2 and Llama-3.1-8B-Instruct (both already part of the broader \BCA{} evaluation) would test whether the depth-conditional fit's accuracy on jailbroken behaviors generalizes.
+
+\paragraph{Judge dependence in the abstraction.}
+The four-state abstraction depends on a semantic harm judge applied at every tree node, not just at leaves.  The judge's training distribution is full-completion responses; short mid-generation continuations may receive noisy labels.  We mitigate this with a length gate ($\tau_\mathrm{min} = 12$ characters) but cannot rule out residual judge noise as a contributor to non-stationarity.  An ensemble judge or a verifier-style classifier trained on partial completions would isolate the effect.
+
+\paragraph{One training window.}
+We only tested $L_\mathrm{train} = 5$ at $L_\mathrm{max} = 10$.  The mechanism analysis predicts that $L_\mathrm{train} \in \{6, 8\}$ would reduce overshoot on hesitant behaviors and would correctly handle the \textsc{sudo\_access} outlier.  This sweep is the most informative follow-up experiment and is straightforward to run.
+
+\paragraph{Markov assumption in the abstraction.}
+We treat the abstract state as a sufficient statistic for next-step prediction.  Even within the jailbroken regime the empirical fit will not be exactly Markov because the underlying LLM is not Markov on the abstract space (the concrete prefix string is the true state).  The near-exact recovery on jailbroken behaviors suggests this is a small effect in practice but is not proved.
+
+\paragraph{Single horizon test.}
+We test at $L_\mathrm{max}=10$ only.  The strongest motivation for the abstraction is extrapolation to $L_\mathrm{max} \in \{30, 50\}$, where \BCA{}'s \SMC{} estimator becomes the only available baseline.  Comparing the abstract chain to \SMC{} estimates at those depths is the natural next experiment.
+
+\paragraph{Behavior coverage.}
+Twenty behaviors per condition is enough to characterize the mechanism but not enough to claim distributional rates.  Cross-validating on the remaining 80 JBB behaviors and the 200 HarmBench behaviors would tighten the error bars in \Cref{tab:overall}.
 
 \section{Related Work}
 \label{sec:related}
 
-\paragraph{LLM probabilistic model checking.}  LLMCHECKER \cite{gross2025llmchecker} introduced bounded \DTMC{} model checking for LLM-generated text and evaluated text-quality PCTL properties.  Our prior work \cite{ourbca} adapted bounded \DTMC{} verification to jailbreak evaluation with a semantic harm judge.  Both restrict $L$ to depths where concrete enumeration is tractable.
+\paragraph{Jailbreak benchmarks.}
+HarmBench and JailbreakBench provide standardized harmful behavior sets and automated evaluation procedures for red-teaming LLMs.  \BCA{} builds on this benchmarking view but changes the measured object from sampled outcomes to bounded distributional mass.
 
-\paragraph{State abstraction in probabilistic model checking.}  Lumping and bisimulation-based abstraction \cite{baier2008principles} are standard tools for compressing intractable Markov chains.  Exact lumpability requires that all states in a bucket have identical transition distributions to other buckets, which is rarely true; approximate lumpability with error bounds \cite{buchholz1994exact} relaxes this.  Our \Cref{prop:lump-preserve} is exact for the $\mathbf{F}\,\harm$ \emph{property}, not for the chain dynamics; it leverages absorbing semantics rather than a global lumping condition.
+\paragraph{Attack success-rate validity.}
+Recent work argues that attack success-rate comparisons can be measurement-invalid when threat models, judges, sampling budgets, and attack costs differ \cite{chouldechova2026measurement}.  \BCA{} does not replace valid \ASR{} measurement; it adds a complementary distributional diagnostic that can be reported under explicit bounding and evaluator assumptions.
 
-\paragraph{Statistical model checking.}  When concrete enumeration is intractable, \SMC \cite{younes2002probabilistic,legay2010statistical} estimates reachability probabilities by sampling.  Our abstract-chain estimator is an alternative when \SMC's Hoeffding budget is too coarse: at $N=200$ samples and $\delta=0.05$ the \SMC{} half-width is $\approx 0.10$, which our depth-conditional fit improves on by an order of magnitude in the jailbroken regime.
+\paragraph{Probabilistic model checking for LLMs.}
+LLMChecker formalizes LLM generation as a bounded \DTMC{} and evaluates PCTL properties over generated text \cite{gross2025llmchecker}.  Our work applies the same broad formal-methods perspective to jailbreak evaluation, introduces semantic harmful-reachability metrics, and evaluates whether bounded mass predicts empirical attack success.
 
-\paragraph{Trajectory abstraction for control and planning.}  Hierarchical abstractions of Markov decision processes are common in reinforcement learning \cite{sutton1999between}.  The closest analogue in the LLM safety literature is work that treats generated text as a sequence of higher-level rhetorical or semantic events; we use a similar conceptual move but optimize directly for $\Prob[\mathbf{F}\,\harm]$ rather than a downstream reward.
+\paragraph{State abstraction in probabilistic model checking.}
+Lumping and bisimulation-based abstraction \cite{baier2008principles} are standard tools for compressing intractable Markov chains.  Exact lumpability requires that all states in a bucket have identical transition distributions to other buckets, which is rarely true; approximate lumpability with error bounds \cite{buchholz1994exact} relaxes this.  Our \Cref{prop:lump-preserve} is exact for the $\mathbf{F}\,\harm$ \emph{property}, not for the chain dynamics; it leverages absorbing semantics rather than a global lumping condition.
+
+\paragraph{Statistical model checking.}
+SMC has long been used to estimate probabilistic temporal properties when exact model checking is infeasible \cite{younes2002probabilistic,legay2010statistical}.  Here, each sampled bounded continuation is a path through an LLM-induced stochastic process, and the property indicator is provided by a semantic harm judge.  Our abstract-chain estimator is an alternative when \SMC's Hoeffding budget is too coarse: at $N=200$ samples and $\delta=0.05$ the \SMC{} half-width is $\approx 0.10$, which the depth-conditional fit improves on by an order of magnitude in the jailbroken regime.
+
+\paragraph{Trajectory abstraction for control and planning.}
+Hierarchical abstractions of Markov decision processes are common in reinforcement learning \cite{sutton1999between}.  The closest analogue in the LLM safety literature is work that treats generated text as a sequence of higher-level rhetorical or semantic events; we use a similar conceptual move but optimize directly for $\Prob[\mathbf{F}\,\harm]$ rather than a downstream reward.
 
 \section{Conclusion}
 \label{sec:conclusion}
 
-Bounded continuation analysis gives a clean probabilistic estimate of $\Prob[\mathbf{F}\,\harm]$ at short horizons but cannot directly answer questions about longer-horizon trajectories.  We tested whether a four-state safety-relevant abstraction with an empirically-fit Markov chain can extrapolate $\Prob[\mathbf{F}\,\harm]$ from $L_\mathrm{train}=5$ to $L_\mathrm{max}=10$.  The lumping itself is information-preserving for the absorbing $\mathbf{F}\,\harm$ semantics, and on jailbroken behaviors---the regime in which \BCA{}-guided attacks operate---the depth-conditional fit recovers the concrete probability within $\pm 0.003$ on 19 of 20 behaviors.
+Attack success rate asks whether a sampled response is harmful.  That is necessary, but incomplete.  Bounded continuation analysis asks how much harmful probability mass exists nearby in the model's conditional output distribution.  Across JailbreakBench behaviors and four instruction-tuned models, this diagnostic reveals hidden harmful mass under greedy-safe outputs, separates models with identical greedy \ASR, identifies template families that unlock harmful mass, and predicts empirical attack success under query constraints.
 
-The single mechanism that explains every failure mode is the relative position of the model's compliance-decision depth $d^*$ with respect to the training window $L_\mathrm{train}$.  Behaviors with $d^* \leq L_\mathrm{train}$ are handled accurately by the depth-conditional fit.  Behaviors with $d^* > L_\mathrm{train}$ are missed completely.  Hesitant behaviors with a transient $d^*$ inside the window are overshot.  All three failure modes are detectable from the stationarity diagnostic of the trained chain without ever building the long-horizon concrete tree.
+\BCA's residual limitation is horizon: exact verification scales as $O(k^L)$, capping the practical $L$ far below the realised completion length.  We close this gap with a four-state safety-relevant abstraction whose lumping is information-preserving for $\mathbf{F}\,\harm$ under absorbing semantics, and whose empirically-fit Markov chain extrapolates $\Prob[\mathbf{F}\,\harm]$ from $L_\mathrm{train}=5$ to $L_\mathrm{max}=10$ within $\pm 0.003$ on $19/20$ jailbroken JBB behaviors.  A single mechanism---the position of the model's compliance-decision depth $d^*$ relative to $L_\mathrm{train}$---explains every failure mode and is detectable from the stationarity diagnostic of the trained chain without ever constructing the long-horizon concrete tree.
 
-The practical consequence is that the abstraction is reliable for the use cases that motivate \BCA{} most strongly: $\BCA$-guided template search, $\BCA$-guided attack scoring, and conservative safety verification.  The main remaining engineering problem is choosing $L_\mathrm{train}$ adaptively per behavior, using the stationarity diagnostic as a stopping rule.
+The central takeaway is not that \BCA{} or its abstract-chain extension proves safety.  Neither does.  The takeaway is that local distributional structure matters, and that it remains observable beyond the depths at which concrete enumeration is feasible.  A refusal supported by nearly all likely continuations is different from a refusal that is merely the greedy path; a jailbreak that commits at depth two is different from one that commits at depth six; a hesitant prompt with a transient harmful spike is different from one with a stable harmful flow.  \BCA{} and the abstract chain together make those differences measurable.
 
 \appendix
 
 \section{Implementation Notes}
 \label{app:implementation}
 
-The bounded tree is built by the BFS construction of \cite{ourbca}.  Each depth's active prefixes are submitted to vLLM in one batched call, exploiting prefix caching for the shared prompt prefix.  Each non-terminal node $s$ at depth $d$ has its abstract label computed once, in a single batched judge call that processes every non-terminal node in the entire tree (across all depths) per behavior.  This batched-judge design amortizes the judge's vLLM warmup and prefix-caches the shared behavior prompt across the full tree.
+The implementation uses breadth-first expansion so all active prefixes at a given depth can be processed in batched model calls.  Exact verification stores the bounded tree and performs reverse-depth value propagation.  Semantic \DTMC{} mode labels terminal leaves with the Qwen2.5-7B semantic judge and then computes exact $\Prob[\mathbf{F}\,\harm]$.  SMC mode samples bounded trajectories and applies the same judge to sampled terminal continuations.
 
-Forward-marginal computation uses a single linear pass over the tree.  Backward induction for the concrete ground truth uses the absorbing $\mathbf{F}\,\harm$ semantics described in \Cref{prop:lump-preserve}.  Stationarity and lumpability diagnostics are computed over the same training-depth window used to fit the chain.
+The exact all-model run used for follow-up analysis keeps the Qwen2.5-7B judge loaded once while switching generator models sequentially.  This avoids reloading the judge for each model and ensures that cross-model exact runs share the same semantic evaluator.
+
+For the long-horizon experiments, each non-terminal node $s$ at depth $d$ has its abstract label computed once, in a single batched judge call that processes every non-terminal node in the entire tree (across all depths) per behavior.  This batched-judge design amortizes the judge's vLLM warmup and prefix-caches the shared behavior prompt across the full tree.  Forward-marginal computation uses a single linear pass over the tree.  Backward induction for the concrete ground truth uses the absorbing $\mathbf{F}\,\harm$ semantics described in \Cref{prop:lump-preserve}.  Stationarity and lumpability diagnostics are computed over the same training-depth window used to fit the chain.
+
+\section{Metric Summary}
+\label{app:metrics}
+
+\begin{description}[leftmargin=*,style=nextline]
+  \item[$\Prob[\mathbf{F}\,\harm]$] Probability that the bounded process eventually reaches a judge-labeled harmful terminal continuation.
+  \item[$\Prob[\mathbf{G}\neg\harm]$] Probability that the bounded process stays safe over the horizon.
+  \item[$\Prob[\refusal\wedge\mathbf{F}\,\harm]$] Probability that a continuation begins with a refusal marker and nevertheless reaches harm.
+  \item[Greedy \ASR] Binary outcome indicating whether the argmax/greedy completion is judged harmful.
+  \item[Empirical \ASR] Fraction of sampled full completions judged harmful.
+  \item[$\widehat\Prob_\mathrm{lump}$] $\Prob[\mathbf{F}\,\harm]$ from forward propagation over the lumped tree; a sanity check that equals concrete $\Prob[\mathbf{F}\,\harm]$ up to floating-point error.
+  \item[$\widehat\Prob_\mathrm{stat}$] Long-horizon prediction from forward simulation of the stationary average transition matrix.
+  \item[$\widehat\Prob_\mathrm{depth}$] Long-horizon prediction from forward simulation of the depth-conditional transition matrices, with the last training matrix used as the extrapolation fallback.
+  \item[$\TV_\mathrm{stat}(z, d)$] Total-variation distance between $P_d[z, \cdot]$ and $P_{d+1}[z, \cdot]$; detects non-stationarity.
+  \item[$\TV_\mathrm{lump}(z, d)$] Mass-weighted average TV distance between per-concrete-state next-step distributions inside the bucket $\phi^{-1}(z) \cap \{\mathrm{depth} = d\}$; detects lumpability violations.
+  \item[$d^*$] Decision-moment depth; smallest $d$ at which $\TV_\mathrm{stat}(\ambiguous, d)$ exceeds a fixed threshold (we use $0.2$).
+\end{description}
 
 \section{Diagnostic Schema}
 \label{app:diagnostics}
 
-For each behavior we record the following objects in addition to the three probability estimates:
+For each long-horizon behavior we record the following objects in addition to the three probability estimates:
 
 \begin{description}[leftmargin=*,style=nextline]
   \item[Abstract mass trajectory (truth).] For $d = 0, \ldots, L_\mathrm{max}$, the unabsorbed concrete mass in each abstract state.  This is not the absorbing $\mathbf{F}\,\harm$ accumulation; it is the live classification distribution.
@@ -470,19 +961,9 @@ For each behavior we record the following objects in addition to the three proba
 \section{Code and Data}
 \label{app:code}
 
-The experiments are implemented in a single self-contained Python module that depends on the gpu\_llmchecker library for bounded-\DTMC{} construction and on the judges module for the vLLM-backed Qwen judge.  Result JSON files contain, for each behavior, the full per-depth diagnostics described above.
+The \BCA{} pipeline is implemented in the \texttt{gpu\_llmchecker} library.  The long-horizon experiments are implemented in a single self-contained Python module that depends on \texttt{gpu\_llmchecker} for bounded-\DTMC{} construction and on a unified judges module for the vLLM-backed Qwen judge.  Result JSON files contain, for each behavior, the full per-depth diagnostics described above.
 
 \begin{thebibliography}{99}
-
-\bibitem{ourbca}
-Parv Kapoor.
-\newblock Beyond attack success rate: Estimating hidden harmful probability mass in LLM outputs.
-\newblock Technical Report, Carnegie Mellon University, 2026.
-
-\bibitem{gross2025llmchecker}
-David Gross, Helge Spieker, and Arnaud Gotlieb.
-\newblock Bounded PCTL model checking of large language model outputs.
-\newblock arXiv preprint, 2025.
 
 \bibitem{baier2008principles}
 Christel Baier and Joost-Pieter Katoen.
@@ -494,25 +975,50 @@ Peter Buchholz.
 \newblock Exact and ordinary lumpability in finite Markov chains.
 \newblock \emph{Journal of Applied Probability}, 31(1):59--75, 1994.
 
-\bibitem{younes2002probabilistic}
-H{\'a}lim L. S. Younes and Reid G. Simmons.
-\newblock Probabilistic verification of discrete event systems using acceptance sampling.
-\newblock In \emph{Computer Aided Verification}, 2002.
+\bibitem{chouldechova2026measurement}
+Alex Chouldechova, A. Feder Cooper, Solon Barocas, Abhinav Palia, Dan Vann, and Hanna Wallach.
+\newblock Comparison requires valid measurement: Rethinking attack success rate comparisons in AI red teaming.
+\newblock \emph{Advances in Neural Information Processing Systems}, 38, 2026.
+
+\bibitem{gross2025llmchecker}
+David Gross, Helge Spieker, and Arnaud Gotlieb.
+\newblock Bounded PCTL model checking of large language model outputs.
+\newblock arXiv preprint, 2025.
+
+\bibitem{hansson1994logic}
+Hans Hansson and Bengt Jonsson.
+\newblock A logic for reasoning about time and reliability.
+\newblock \emph{Formal Aspects of Computing}, 6(5):512--535, 1994.
+
+\bibitem{hoeffding1963}
+Wassily Hoeffding.
+\newblock Probability inequalities for sums of bounded random variables.
+\newblock \emph{Journal of the American Statistical Association}, 58(301):13--30, 1963.
 
 \bibitem{legay2010statistical}
 Axel Legay, Beno\^{i}t Delahaye, and Saddek Bensalem.
 \newblock Statistical model checking: An overview.
 \newblock In \emph{Runtime Verification}, 2010.
 
+\bibitem{mazeika2024harmbench}
+Mantas Mazeika et al.
+\newblock HarmBench: A standardized evaluation framework for automated red teaming and robust refusal.
+\newblock 2024.
+
+\bibitem{chao2024jailbreakbench}
+Patrick Chao et al.
+\newblock JailbreakBench: An open robustness benchmark for jailbreaking large language models.
+\newblock 2024.
+
 \bibitem{sutton1999between}
 Richard S. Sutton, Doina Precup, and Satinder Singh.
 \newblock Between MDPs and semi-MDPs: A framework for temporal abstraction in reinforcement learning.
 \newblock \emph{Artificial Intelligence}, 112(1--2):181--211, 1999.
 
-\bibitem{hoeffding1963}
-Wassily Hoeffding.
-\newblock Probability inequalities for sums of bounded random variables.
-\newblock \emph{Journal of the American Statistical Association}, 58(301):13--30, 1963.
+\bibitem{younes2002probabilistic}
+H{\'a}lim L. S. Younes and Reid G. Simmons.
+\newblock Probabilistic verification of discrete event systems using acceptance sampling.
+\newblock In \emph{Computer Aided Verification}, 2002.
 
 \end{thebibliography}
 
