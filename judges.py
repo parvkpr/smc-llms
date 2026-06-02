@@ -437,6 +437,32 @@ class VLLMQwenLegacyJudge(Judge):
             top_k=-1,
         )
 
+    @classmethod
+    def from_vllm_backend(
+        cls,
+        backend: Any,
+        *,
+        device: str = "cuda:0",
+        model_id: Optional[str] = None,
+    ) -> "VLLMQwenLegacyJudge":
+        """Reuse an existing vLLM engine (e.g. shared with TAP attacker on same GPU)."""
+        judge = cls(device=device, model_id=model_id or getattr(backend, "model_name", None))
+        judge._llm = backend.llm
+        judge._tok = backend.tokenizer
+        try:
+            from vllm import SamplingParams  # type: ignore
+
+            judge._sampling_params = SamplingParams(
+                n=1,
+                max_tokens=1,
+                temperature=0.0,
+                top_p=1.0,
+                top_k=-1,
+            )
+        except ImportError as e:
+            raise ImportError("vllm is required for VLLMQwenLegacyJudge") from e
+        return judge
+
     def score_responses_int10(self, items: Iterable[dict]) -> List[int]:
         self.load()
         items = list(items)

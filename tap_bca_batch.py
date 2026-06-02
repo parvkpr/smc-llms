@@ -383,14 +383,23 @@ def _resolve_gpu_layout(args: argparse.Namespace) -> None:
     if args.attack_model == args.target_model:
         return
 
-    # Two GPUs, three models: target vLLM alone on GPU 1; attacker + judge HF on GPU 0.
+    shared_qwen = args.attack_model == args.judge_model
+    # Target alone on GPU 1; attacker (+ judge) on GPU 0.
     args.device = "cuda:1"
     args.attack_device = "cuda:0"
     args.judge_device = "cuda:0"
+    if shared_qwen:
+        args.judge_backend = "vllm"
+        print(
+            f"GPU layout: target vLLM {args.device}; "
+            f"shared Qwen vLLM (attack+judge) {args.attack_device}",
+            flush=True,
+        )
+        return
+
     if args.judge_backend == "vllm":
         print(
-            "Note: --judge-backend vllm incompatible with HF attacker on cuda:0; "
-            "using HF judge on cuda:0.",
+            "Note: separate attack/judge models — using HF judge on cuda:0 with HF attacker.",
             flush=True,
         )
         args.judge_backend = "hf"
@@ -401,6 +410,31 @@ def _resolve_gpu_layout(args: argparse.Namespace) -> None:
         f"judge {args.judge_backend} {args.judge_device}",
         flush=True,
     )
+
+
+def _build_shared_qwen_stack(
+    args: argparse.Namespace,
+) -> Tuple[Any, Any]:
+    """One Qwen vLLM on cuda:0 for both TAP attacker chat and judge scoring."""
+    idx = _dev_idx(args.attack_device)
+    os.environ["CUDA_VISIBLE_DEVICES"] = idx
+    print(
+        f"Attack+Judge: shared Qwen vLLM on physical cuda:{idx} ({args.attack_model})",
+        flush=True,
+    )
+    backend = VLLMBackend(
+        args.attack_model,
+        max_logprobs=args.vllm_max_logprobs,
+        gpu_memory_utilisation=args.judge_vllm_gpu_mem,
+        enable_prefix_caching=True,
+        max_model_len=args.judge_vllm_max_len,
+    )
+    from judges import VLLMQwenLegacyJudge
+
+    judge = VLLMQwenLegacyJudge.from_vllm_backend(
+        backend, model_id=args.judge_model
+    )
+    return backend, judge
 
 
 def _build_attack_backend(args: argparse.Namespace) -> Any:
@@ -468,17 +502,28 @@ def main(args: argparse.Namespace) -> None:
     prev_cuda = os.environ.get("CUDA_VISIBLE_DEVICES")
     target_backend = _build_target_backend(args)
 
-    if args.attack_model != args.target_model:
+    shared_qwen = (
+        args.attack_model == args.judge_model
+        and args.attack_model != args.target_model
+    )
+    if shared_qwen:
+        if prev_cuda is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda
+        attack_backend, judge_pipeline = _build_shared_qwen_stack(args)
+    elif args.attack_model != args.target_model:
         if prev_cuda is None:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         else:
             os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda
         attack_backend = _build_attack_backend(args)
+        print("Loading semantic judge:", args.judge_model, flush=True)
+        judge_pipeline = _build_judge(args)
     else:
         attack_backend = target_backend
-
-    print("Loading semantic judge:", args.judge_model, flush=True)
-    judge_pipeline = _build_judge(args)
+        print("Loading semantic judge:", args.judge_model, flush=True)
+        judge_pipeline = _build_judge(args)
     if prev_cuda is None:
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
     else:
