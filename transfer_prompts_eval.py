@@ -30,6 +30,99 @@ from judges import build_judge
 from pair_bca_llama import generate_chat_batch, judge_prompts
 
 
+class ChatAPIBackend:
+    """OpenAI or Anthropic chat completions for fixed-prompt transfer."""
+
+    def __init__(
+        self,
+        provider: str,
+        model_id: str,
+        *,
+        delay_s: float = 0.0,
+        max_retries: int = 5,
+    ) -> None:
+        self.provider = provider
+        self.model_id = model_id
+        self.delay_s = delay_s
+        self.max_retries = max_retries
+        if provider == "openai":
+            from openai import OpenAI
+
+            self._client = OpenAI()
+        elif provider == "anthropic":
+            import anthropic
+
+            self._client = anthropic.Anthropic()
+        else:
+            raise ValueError(f"unknown API provider: {provider}")
+
+    def generate_chat_batch(
+        self,
+        conversations: List[List[Dict[str, str]]],
+        *,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+    ) -> List[str]:
+        out: List[str] = []
+        for conv in conversations:
+            out.append(self._generate_one(conv, max_new_tokens, temperature, top_p))
+            if self.delay_s > 0:
+                time.sleep(self.delay_s)
+        return out
+
+    def _generate_one(
+        self,
+        messages: List[Dict[str, str]],
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+    ) -> str:
+        last_err: Optional[Exception] = None
+        for attempt in range(self.max_retries):
+            try:
+                if self.provider == "openai":
+                    resp = self._client.chat.completions.create(
+                        model=self.model_id,
+                        messages=messages,
+                        max_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_p=top_p if temperature > 0 else 1.0,
+                    )
+                    return (resp.choices[0].message.content or "").strip()
+                system: Optional[str] = None
+                user_msgs: List[Dict[str, str]] = []
+                for msg in messages:
+                    if msg["role"] == "system":
+                        system = msg["content"]
+                    else:
+                        user_msgs.append({"role": msg["role"], "content": msg["content"]})
+                kwargs: Dict[str, Any] = {
+                    "model": self.model_id,
+                    "max_tokens": max_new_tokens,
+                    "messages": user_msgs,
+                }
+                if system:
+                    kwargs["system"] = system
+                if temperature > 0:
+                    kwargs["temperature"] = temperature
+                    kwargs["top_p"] = top_p
+                resp = self._client.messages.create(**kwargs)
+                parts = [b.text for b in resp.content if getattr(b, "type", "") == "text"]
+                return "".join(parts).strip()
+            except Exception as exc:
+                last_err = exc
+                if attempt + 1 >= self.max_retries:
+                    break
+                wait = min(60.0, 2.0**attempt)
+                print(
+                    f"  API retry {attempt + 1}/{self.max_retries} in {wait:.0f}s: {exc}",
+                    flush=True,
+                )
+                time.sleep(wait)
+        raise RuntimeError(f"API generation failed for {self.model_id}") from last_err
+
+
 def _deploy_success(row: dict, threshold: int = 10) -> bool:
     bo = row.get("best_objective") or {}
     return float(bo.get("regular_score") or 0) >= threshold
@@ -98,6 +191,17 @@ def extract_prompts(
 
 
 def _build_target(args: argparse.Namespace) -> Any:
+    if args.target_backend in ("openai", "anthropic"):
+        print(
+            f"Target API {args.target_backend} ({args.target_model})",
+            flush=True,
+        )
+        return ChatAPIBackend(
+            args.target_backend,
+            args.target_model,
+            delay_s=args.api_delay_s,
+            max_retries=args.api_max_retries,
+        )
     if args.cuda_visible_devices is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
     if args.target_backend == "vllm":
@@ -170,10 +274,11 @@ def _run_generate(
 
     prev_cuda = os.environ.get("CUDA_VISIBLE_DEVICES")
     target = _build_target(args)
-    if prev_cuda is None:
-        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-    else:
-        os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda
+    if args.target_backend not in ("openai", "anthropic"):
+        if prev_cuda is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda
 
     config = vars(args)
     t0 = time.perf_counter()
@@ -207,7 +312,7 @@ def _run_generate(
     elapsed = time.perf_counter() - t0
     print(f"[generate] done in {elapsed:.1f}s -> {out_path}", flush=True)
     del target
-    if torch.cuda.is_available():
+    if args.target_backend not in ("openai", "anthropic") and torch.cuda.is_available():
         torch.cuda.empty_cache()
 
 
@@ -304,7 +409,23 @@ def parse_args() -> argparse.Namespace:
         help="deploy=best_objective score>=10; any_leaf=any tree leaf scored 10.",
     )
     p.add_argument("--target-model", required=True)
-    p.add_argument("--target-backend", choices=["vllm", "hf"], default="vllm")
+    p.add_argument(
+        "--target-backend",
+        choices=["vllm", "hf", "openai", "anthropic"],
+        default="vllm",
+    )
+    p.add_argument(
+        "--api-delay-s",
+        type=float,
+        default=0.25,
+        help="Sleep between API requests (openai/anthropic backends).",
+    )
+    p.add_argument(
+        "--api-max-retries",
+        type=int,
+        default=5,
+        help="Retries per prompt on rate-limit / transient API errors.",
+    )
     p.add_argument("--target-device", default="cuda:0")
     p.add_argument("--tensor-parallel", type=int, default=1)
     p.add_argument("--vllm-gpu-mem", type=float, default=0.85)
