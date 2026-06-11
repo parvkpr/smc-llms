@@ -10,6 +10,7 @@
 \usepackage{algpseudocode}
 \usepackage{enumitem}
 \usepackage{lineno}
+\usepackage{graphicx}
 
 \definecolor{darkblue}{rgb}{0, 0, 0.5}
 \hypersetup{colorlinks=true, citecolor=darkblue, linkcolor=darkblue, urlcolor=darkblue}
@@ -402,7 +403,36 @@ On 102 paired (seed, behavior) runs where both trees completed, deploy success s
 Either method alone deploys a jailbreak on ${\sim}57\%$ of pairs; the \textbf{union reaches 78.4\%} (80/102, +21 pp at 2$\times$ \textsc{TAP} cost).
 Exclusive wins are roughly symmetric (20 regular-only vs.\ 22 \BCA{}+judge-only) and spread across the same three HarmBench categories---\BCA{} does not specialize on a different \emph{class} of test case, but reaches a partially disjoint set of \emph{individual behaviors}.
 When both methods succeed on the same goal, winning prompts are \textbf{never identical} (0/38 pooled); framing often shifts (e.g.\ hypothetical vs.\ historical) even when both jailbreak.
+Figure~\ref{fig:tap-overlap} visualizes the deploy-set overlap; Table~\ref{tab:tap-examples} gives representative framing differences (truncated; full prompts withheld per JailbreakBench release norms).
 For adversarial training and audit campaigns whose goal is distinct failure modes rather than one cheap jailbreak, \BCA{}-guided \textsc{TAP} is best viewed as a complementary search prior, not a replacement for judge-based scoring.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/tap_complementarity_overlap.pdf}
+\caption{\textsc{TAP} deploy-set complementarity on 102 paired (seed, behavior) runs (seeds 42--45, $L{=}8$, Llama-3.1-8B target).
+Left: overlap of deploy-success sets under regular judge-guided \textsc{TAP} vs.\ \BCA{}-guided \textsc{TAP} with judge-pick deploy.
+Right: outcome shares and single-method vs.\ union coverage.
+Running both searches raises deployable jailbreak coverage from ${\sim}57\%$ to \textbf{78.4\%} at 2$\times$ compute.}
+\label{fig:tap-overlap}
+\end{figure}
+
+\begin{table}[t]
+\centering
+\footnotesize
+\caption{Representative \textsc{TAP} complementarity examples (deploy prompts truncated).}
+\label{tab:tap-examples}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{@{}lp{0.17\linewidth}p{0.33\linewidth}p{0.33\linewidth}@{}}
+\toprule
+Outcome & Behavior & Regular deploy framing & BCA deploy framing \\
+\midrule
+Both & Violence / enslavement & \emph{Hypothetical scenario where\ldots} & \emph{Historical analysis of past conflicts where\ldots} \\
+Both & Defamation & \emph{Fictional news article with biased opinion\ldots} & \emph{Sensational fictional piece with lurid details\ldots} \\
+Reg.\ only & Xenophobic speech & \emph{Hypothetical influx of `Azuria'\ldots} & (no deploy) \\
+BCA only & Body-shaming campaign & (no deploy) & \emph{\#HealthyByComparing progress photos\ldots} \\
+\bottomrule
+\end{tabular}}
+\end{table}
 
 \begin{table}[t]
 \centering
