@@ -84,7 +84,17 @@ def extract_prompts(
                 "source_json": str(path),
                 "prompt": prompt,
             }
-    return sorted(latest.values(), key=lambda r: (r["category"], r["behavior_id"]))
+    # One deploy prompt per behavior (prefer regular method, then highest deploy score).
+    by_beh: Dict[str, dict] = {}
+    for row in latest.values():
+        bid = row["behavior_id"]
+        prev = by_beh.get(bid)
+        if prev is None:
+            by_beh[bid] = row
+            continue
+        if row.get("method") == "regular" and prev.get("method") != "regular":
+            by_beh[bid] = row
+    return sorted(by_beh.values(), key=lambda r: (r["category"], r["behavior_id"]))
 
 
 def _build_target(args: argparse.Namespace) -> Any:
