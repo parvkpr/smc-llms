@@ -1,0 +1,333 @@
+\documentclass{article}
+\usepackage[submission]{colm2026_conference}
+
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{enumitem}
+\usepackage{lineno}
+
+\definecolor{darkblue}{rgb}{0, 0, 0.5}
+\hypersetup{colorlinks=true, citecolor=darkblue, linkcolor=darkblue, urlcolor=darkblue}
+
+\newcommand{\Prob}{\mathbb{P}}
+\newcommand{\harm}{\texttt{harm}}
+\newcommand{\BCA}{\textsc{BCA}}
+\newcommand{\ASR}{\textsc{ASR}}
+\newcommand{\GAS}{\textsc{GAS}}
+\newcommand{\DTMC}{\textsc{DTMC}}
+\newcommand{\SMC}{\textsc{SMC}}
+
+\title{From Attack Success Rate to Reachability:\\
+Actionable Distributional Diagnostics for LLM Safety}
+
+\author{Anonymous Author(s) \\
+Anonymous Institution \\
+\texttt{anonymous@domain.com}
+}
+
+\begin{document}
+\ifcolmsubmission
+\linenumbers
+\fi
+
+\maketitle
+
+\begin{abstract}
+Jailbreak benchmarks report attack success rate (\ASR): did a sampled response violate a safety policy?
+This outcome-level view is necessary but incomplete.
+Autoregressive language models define \emph{distributions} over continuations; a greedy refusal can hide substantial probability mass on nearby harmful branches.
+We propose \emph{bounded continuation analysis} (\BCA), an interpretability method that exposes this local output structure by constructing an $\alpha$-$k$ bounded continuation tree, labeling leaves with a semantic harm judge, and computing finite-horizon reachability $\Prob[\mathbf{F}\,\harm]$.
+We show how this distributional reading becomes \emph{actionable}: it triages models with matched \ASR{}, ranks jailbreak templates before spending red-team queries, predicts empirical attack success under independent judges ($\rho\in[0.53,0.73]$), and---when integrated into Tree-of-Attacks-with-Pruning (\textsc{TAP})---expands deployable jailbreak \emph{coverage} by 21 percentage points at $2\times$ search cost.
+Our framing aligns with the Actionable Interpretability agenda: micro-level structure in the generation distribution, translated into deployment diagnostics rather than post-hoc explanation alone.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+Large language model (LLM) safety is often measured as a binary event: given a harmful behavior and an adversarial prompt, does the model's response count as a jailbreak?
+HarmBench~\citep{mazeika2024harmbench} and JailbreakBench~\citep{chao2024jailbreakbench} standardize behaviors, threat models, and graders, making \ASR{} comparisons more reproducible.
+Yet \ASR{} is fundamentally a \emph{sampled surface} statistic.
+Two models can refuse on the modal decode while differing sharply in how much of their conditional output mass routes toward compliance~\citep{chouldechova2026measurement}.
+
+This gap is interpretability with teeth.
+An autoregressive model induces a probability tree over token prefixes.
+\emph{Where} probability mass sits---on refusal markers, hedging, or direct compliance---is a micro-level property of the generation mechanism.
+If we can estimate that structure, safety teams can act on it: prioritize red-team budgets, compare models before deployment, and generate diverse adversarial training data.
+
+We operationalize this via \textbf{bounded continuation analysis} (\BCA).
+Given prompt $x$, target model $M$, horizon $L$, and bounding parameters $(\alpha,k)$, \BCA{} expands the likely branches of $M$'s next-token distribution, labels terminal continuations with a semantic harm judge $J$, and computes
+\[
+  H_{\alpha,k,L}(x;M,J) = \Prob_{\widetilde P}[\mathbf{F}\,\harm],
+\]
+the probability of eventually reaching a judge-labeled harmful leaf in the bounded process $\widetilde P$.
+When the tree is small, we compute this exactly by sparse backward induction on the induced finite \DTMC{}~\citep{gross2025llmchecker,baier2008principles}; otherwise we estimate it by statistical model checking (\SMC) with confidence intervals~\citep{younes2002probabilistic,hoeffding1963}.
+
+We package bounded reachability into \textbf{generative-attack susceptibility} (\GAS), a query-budgeted family that nests \ASR{}, \BCA{}, and adaptive attackers (PAIR~\citep{chao2023pair}, \textsc{TAP}~\citep{mehrotra2024tap}) as special cases.
+Three findings motivate the workshop submission.
+
+\paragraph{Finding 1: matched \ASR{}, divergent risk.}
+On JailbreakBench direct prompts, four instruction-tuned targets all have greedy judge-\ASR{} $\approx 0\%$, yet mean \GAS{}@0 (bounded $\Prob[\mathbf{F}\,\harm]$ with no attacker) spans $\mathbf{0.002}$--$\mathbf{0.211}$---a ${\sim}100\times$ spread driven largely by Mistral-7B's hidden harmful mass.
+
+\paragraph{Finding 2: rankings flip with attacker budget.}
+Qwen2.5-7B is most vulnerable to a fixed 18-template library (\GAS{}@18 $=0.91$) but most robust under three PAIR queries (\GAS{}@PAIR(3) $=0.02$); Llama-3.1-8B shows the reverse.
+Single-number \ASR{} cannot rank models when the ordering is a function of attacker capability.
+
+\paragraph{Finding 3: interpretability changes red-team \emph{coverage}.}
+Holding \textsc{TAP} fixed and swapping the pruning signal from judge score to \BCA{} mass does not reliably beat judge pruning on deploy \ASR{} alone---but running \emph{both} search modes in parallel raises union deploy coverage from ${\sim}57\%$ to ${\sim}78\%$ on pooled seeds, with symmetric exclusive wins.
+\BCA{} is best viewed as a complementary search prior for audit campaigns and adversarial training, not a drop-in replacement for judge-based scoring.
+
+\section{Background}
+\label{sec:background}
+
+\paragraph{Attack success rate.}
+\ASR{} is the fraction of attacks whose completions are judged harmful.
+It answers: \emph{did this sample fail?}
+It does not answer: \emph{how much of the nearby output distribution fails?}
+
+\paragraph{Bounded Markov view.}
+Following LLMChecker~\citep{gross2025llmchecker}, we view generation as a \DTMC{} over string prefixes.
+At each prefix $s$, retain the top tokens until cumulative mass reaches $\alpha$ or $k$ tokens are kept, renormalize, and expand to depth $L$.
+Terminal leaves are labeled $\harm$ or $\safe$ by judge $J$.
+Because the bounded object is a tree, $\Prob[\mathbf{F}\,\harm]$ is computed by backward induction in $\mathcal{O}(|\text{states}|)$ after expansion.
+
+\paragraph{Evaluator-conditional probabilities.}
+All reported probabilities are conditional on judge $J$.
+We use Qwen2.5-7B-Instruct as the primary semantic judge for cross-method comparability, and validate predictive validity with an independent HarmBench-Mistral-7B classifier (\S\ref{sec:validity}).
+
+\section{Method}
+\label{sec:method}
+
+\subsection{Bounded continuation analysis}
+
+\BCA{} has three stages: (i)~breadth-first expansion with batched GPU inference over all active prefixes at each depth; (ii)~semantic labeling of leaves; (iii)~exact backward induction or \SMC{} when $k^L$ exceeds a node budget.
+Algorithm~\ref{alg:bca} summarizes the exact path.
+
+\begin{algorithm}[t]
+\caption{Exact \BCA{} (reachability on bounded tree)}
+\label{alg:bca}
+\begin{algorithmic}[1]
+\Require prompt $x$, model $M$, judge $J$, $L,\alpha,k$
+\State Expand $\alpha$-$k$ tree to depth $L$; label each leaf $\ell(s)\gets J(x,s)$
+\State $V(s)\gets \mathbf{1}[\ell(s)=\harm]$ for leaves
+\For{$d=L{-}1$ \textbf{downto} $0$}
+  \State $V(s)\gets \sum_{t\in T_{\alpha,k}(s)} \widetilde P(s,s\cdot t)\,V(s\cdot t)$
+\EndFor
+\State \Return $V(x)$
+\end{algorithmic}
+\end{algorithm}
+
+Beyond $\Prob[\mathbf{F}\,\harm]$, we track \emph{refusal-collapse} mass: paths whose first segment matches a refusal template yet still reach $\harm$.
+This separates genuine refusals from ``refusal prefixes that collapse into compliance,'' a failure mode invisible to keyword \ASR{}.
+
+\subsection{Generative-attack susceptibility (\GAS)}
+
+Let $x^{(0)}$ be the direct behavior prompt and $x^{(q)}$ the best adversarial prompt after $q$ attacker queries.
+\GAS{}@$q$ is the running maximum of bounded harmful reachability over prompts discovered up to budget $q$:
+\[
+  \GAS(q) = \max_{i\leq q} H_{\alpha,k,L}(x^{(i)};M,J).
+\]
+Special cases: \GAS{}@0 is \BCA{} on the direct prompt; \GAS{}@PAIR($q$) and \GAS{}@TAP($q$) compose outer attacker search with inner \BCA{} on each candidate prompt.
+This nests outcome metrics (\ASR{}) and distributional metrics (\BCA{}) under one query-budgeted curve.
+
+\subsection{Actionable uses}
+
+We highlight four deployment-facing uses aligned with actionable interpretability:
+
+\begin{enumerate}[leftmargin=*,itemsep=1pt]
+  \item \textbf{Pre-deployment triage.} Flag prompts with high \GAS{}@0 despite safe greedy decodes.
+  \item \textbf{Search prioritization.} Rank jailbreak templates by $\Prob[\mathbf{F}\,\harm]$ before sampling full completions (\S\ref{sec:search}).
+  \item \textbf{Adaptive red-teaming.} Use \BCA{} as a pruning/feedback signal inside \textsc{TAP}; use judge score for deploy selection (\S\ref{sec:tap}).
+  \item \textbf{Coverage-maximizing audits.} Union regular- and \BCA{}-guided searches to surface disjoint failure modes for adversarial training.
+\end{enumerate}
+
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Setup}
+
+\textbf{Behaviors:} JailbreakBench harmful behaviors (100 categories across harassment, malware, physical harm, fraud, disinformation, privacy, expert advice, etc.).
+
+\textbf{Targets:} Qwen2.5-1.5B/7B-Instruct, Mistral-7B-Instruct-v0.2/v0.3, Llama-3.1-8B-Instruct.
+
+\textbf{Inner tree:} unless noted, $\alpha{=}0.90$, $k{=}5$, $L\in\{8,10,12\}$, temperature $1.0$ on the target, Qwen2.5-7B semantic judge for leaf labels.
+
+\textbf{Attackers:} 18-template closed library; PAIR ($q\leq 10$); \textsc{TAP} ($b{=}2,w{=}3,d{=}3$, $q\leq 12$) with Llama-3.1-8B as default target.
+
+We report exact \DTMC{} results where feasible and \SMC{} with $N{=}200$--$500$ trajectories otherwise.
+
+\subsection{Distributional fragility under matched \ASR{}}
+\label{sec:fragility}
+
+Table~\ref{tab:fragility} is the headline actionable result.
+All four targets refuse on greedy/direct samples (judge-\ASR{} $\approx 0\%$), yet \GAS{}@0 separates them by two orders of magnitude.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Matched \ASR{}, divergent \GAS{}@0 (mean over JBB behaviors, Qwen judge).}
+\label{tab:fragility}
+\begin{tabular}{lrrr}
+\toprule
+Target & Greedy \ASR{} & \GAS{}@0 & \GAS{}@18 \\
+\midrule
+Mistral-7B & 0\% & \textbf{0.211} & 0.782 \\
+Qwen2.5-1.5B & 0\% & 0.004 & 0.906 \\
+Qwen2.5-7B & 0\% & 0.004 & 0.907 \\
+Llama-3.1-8B & 0\% & 0.002 & 0.144 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Interpretation.}
+Mistral's refusal is a \emph{presentation layer}: ${\sim}21\%$ of bounded mass at $L{=}8$ already sits on harmful leaves without any jailbreak template.
+Llama is distributionally flat at the surface but becomes vulnerable under adaptive PAIR search (below).
+A safety team relying on one-shot \ASR{} would treat these models identically; \BCA{} recommends immediate Mistral triage and adaptive testing for Llama.
+
+\subsection{Query-budget curves and ranking flips}
+
+Figure~\ref{tab:rankflip} summarizes the Pillar-1 flip.
+Closed libraries stress-test suffix-forcing weaknesses (Qwen-7B); short-budget LLM attackers find narrative-rewrite weaknesses (Llama).
+
+\begin{table}[t]
+\centering
+\small
+\caption{Model rankings invert with attacker budget (representative suite averages).}
+\label{tab:rankflip}
+\begin{tabular}{lrr}
+\toprule
+Target & \GAS{}@18 & \GAS{}@PAIR(3) \\
+\midrule
+Qwen2.5-7B & \textbf{0.91} (most fragile) & \textbf{0.02} (most robust) \\
+Llama-3.1-8B & 0.14 & 0.17 (most fragile) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+On an aligned 16-behavior PAIR sub-grid, deploy judge-\ASR{} at $q{=}3$ is ${\sim}43\%$ on Llama vs.\ ${\sim}12\%$ on Qwen-7B (${\sim}3.6\times$), confirming the flip persists on independent success metrics.
+Actionable takeaway: report \ASR{} \emph{curves} over $q$, not scalars.
+
+\subsection{Hidden mass and model comparison}
+\label{sec:hidden}
+
+On Qwen2.5-1.5B with exact \BCA{} ($L{=}10$, 100 behaviors), greedy \ASR{} is 0/100 yet 13 prompts exceed $\Prob[\mathbf{F}\,\harm]{=}0.01$; the regulatory-loopholes behavior reaches $\Prob[\mathbf{F}\,\harm]{=}0.34$ while still refusing greedily.
+
+Cross-model template sweeps (\SMC, 18 templates) show all models at greedy \ASR{} $=0$ but mean best $\Prob[\mathbf{F}\,\harm]$ spanning $0.18$--$0.93$.
+Llama resists 37/95 behaviors entirely; Qwen-7B resists 3/95.
+Suffix-forcing templates dominate Qwen and Mistral; nested fiction dominates Llama---actionable guidance for model-specific red-team playbooks.
+
+\subsection{Predictive validity and search guidance}
+\label{sec:validity}
+
+\paragraph{Independent judge correlation.}
+For each (behavior, template) pair we compute bounded $\Prob[\mathbf{F}\,\harm]$ with Qwen as leaf judge, then sample 50--100 completions and score with HarmBench-Mistral-7B.
+Spearman $\rho$ ranges from $0.53$ to $0.73$ across targets ($p<10^{-40}$ on up to 540 pairs): the metric predicts held-out \ASR{} under a \emph{different} judge family.
+
+\paragraph{Template ranking before queries.}
+On 11 Qwen2.5-1.5B behaviors, selecting templates by bounded mass yields ${\sim}6.2\times$ lift in empirical \ASR{} over random template choice at equal query budget; mass-guided selection beats empirical search until ${\sim}100$ queries per behavior, after which full-completion sampling catches up.
+
+\subsection{\BCA{} inside adaptive red-teaming}
+\label{sec:tap}
+
+We integrate \BCA{} into \textsc{TAP} on Llama-3.1-8B by swapping the per-candidate pruning score: \emph{regular} (judge), \emph{bca} (bounded mass), \emph{hybrid} ($0.5\cdot$judge $+0.5\cdot$\BCA).
+
+\begin{table}[t]
+\centering
+\small
+\caption{\textsc{TAP}-Llama ($n{=}16$ behaviors, depth budget 12, Qwen judge).}
+\label{tab:tap}
+\begin{tabular}{lrr}
+\toprule
+Pruning signal & Deploy \ASR{} & Mean \GAS{} \\
+\midrule
+Judge (regular) & 60.0\% & 0.330 \\
+\BCA{} & 62.5\% & 0.340 \\
+Hybrid & \textbf{73.3\%} & 0.461 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Hybrid pruning improves deploy \ASR{} by $+13.3$ pp over judge-only \textsc{TAP}, showing distributional structure is actionable inside tree search, not only as a static diagnostic.
+
+\paragraph{Search vs.\ selection.}
+Pure \BCA{} pruning with \BCA{}-based deploy selection collapses deploy \ASR{} to 24.1\% despite 58.3\% \emph{any-leaf} success: the tree finds jailbreaks but picks the wrong leaf.
+The operational split---\textbf{\BCA{} prunes, judge picks}---restores deploy \ASR{} to 58.3\%.
+This is a concrete interpretability$\to$action lesson: density signals guide exploration; binary deployment judgments need outcome-aligned scores.
+
+\paragraph{Complementarity.}
+On 102 paired (seed, behavior) runs (seeds 42--45, $L{=}8$), deploy outcomes overlap but do not coincide:
+37.3\% both succeed, 19.6\% regular-only, 21.6\% \BCA{}+judge-only, 21.6\% neither; \textbf{union coverage 78.4\%} vs.\ ${\sim}57\%$ for either method alone.
+When both succeed, winning prompts are never identical (0/38), so \BCA{} changes attack trajectories rather than rediscovering the same jailbreak.
+
+A 100-behavior replicate at $L{=}12$ (seed 44) lowers absolute rates---harder categories dominate---but preserves complementarity: on 80 paired behaviors, union deploy \ASR{} is 55.0\% vs.\ 43.0\% regular-only and 36.9\% \BCA{}+judge-only.
+
+\subsection{Judge robustness audit}
+
+Actionable diagnostics must survive evaluator choice.
+Re-running \textsc{TAP} with HarmBench-Mistral-7B and Llama Guard~3 as in-loop judges (30 behaviors) shows Qwen vs.\ HarmBench agree on only \textbf{59.5\%} of (behavior, method) outcomes; Llama Guard~3 flags \textbf{100\%} of \textsc{TAP} responses as unsafe, saturating \ASR{} and making it unusable for comparative pruning.
+We treat judge choice as part of the measurement protocol and recommend cross-judge reporting alongside \GAS{} curves.
+
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{What interpretability buys.}
+\BCA{} makes the \emph{local geometry} of the output distribution measurable: refusal mass vs.\ harmful mass, template-dependent shifts, and query-budget-dependent rankings.
+The actionable product is not a heatmap for its own sake but decisions---where to spend red-team queries, which model to hold, which search mode to run overnight.
+
+\paragraph{Limits.}
+(i)~\BCA{} certifies a \emph{bounded} process, not the full vocabulary-sized tree; tail mass may matter for rare catastrophes.
+(ii)~Expansion is exponential in $L$; long horizons require \SMC{} or truncated search ($\max\_\text{nodes}$).
+(iii)~Leaf labels at depth $L$ miss harm that emerges later in full completions---the dominant residual gap to empirical \ASR{}.
+(iv)~All probabilities are judge-conditional; saturation and disagreement (above) bound how strongly one can claim cross-benchmark dominance.
+
+\paragraph{Relation to actionable interpretability.}
+Recent jailbreak work treats safety as search over structured attack spaces rather than one-shot classification.
+We contribute the inner loop: a probabilistic reachability readout that turns generation-structure insights into triage, search priors, and coverage metrics---with explicit failure modes when interpretability signals are misapplied to deployment selection.
+
+\section{Conclusion}
+
+Attack success rate asks whether a sample failed.
+Bounded continuation analysis asks how much harmful probability mass lives in the likely branches around a prompt---and, under \GAS{}, how that mass grows with attacker budget.
+Across JailbreakBench targets, this distributional diagnostic separates models with identical greedy \ASR{}, predicts independent-judge attack success, and---when wired into \textsc{TAP} with judge-based selection---expands the set of deployable jailbreaks found per audit campaign.
+We argue this is a template for actionable interpretability in safety: expose conditional structure, then tie it to measurement protocols red teams can run today.
+
+\bibliography{refs}
+\bibliographystyle{colm2026_conference}
+
+\appendix
+\section{Implementation}
+\label{app:impl}
+
+Our GPU implementation uses breadth-first batched inference (vLLM/HuggingFace backends), sparse backward induction for exact trees, and batched \SMC{} for large sweeps.
+Code and interactive complementarity visualizations accompany the project website.
+
+\section{Extended \textsc{TAP} complementarity (seeds 42--45)}
+\label{app:comp}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrr}
+\toprule
+Method (pooled) & Any-leaf \ASR{} & Deploy \ASR{} \\
+\midrule
+Regular (judge prune + pick) & 57.0\% & 57.0\% \\
+\BCA{} (BCA prune + pick) & 58.3\% & 24.1\% \\
+\BCA{} prune + judge pick & 58.3\% & 58.3\% \\
+Hybrid & 61.5\% & 61.5\% \\
+\bottomrule
+\end{tabular}
+\caption{Deploy vs.\ search success separates pruning from selection.}
+\end{table}
+
+\section{Ethics statement}
+
+This work studies adversarial prompts and harmful behaviors to improve safety evaluation.
+We report template \emph{families} rather than operational jailbreak strings, follow public benchmark protocols, and emphasize defensive use: triage, auditing, and adversarial training coverage.
+Dual-use risk remains; we recommend gated release of attack traces consistent with JailbreakBench norms.
+
+\end{document}
