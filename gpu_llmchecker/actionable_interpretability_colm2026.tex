@@ -78,9 +78,10 @@ On JailbreakBench direct prompts, four instruction-tuned targets all have greedy
 Qwen2.5-7B is most vulnerable to a fixed 18-template library (\GAS{}@18 $=0.91$) but most robust under three PAIR queries (\GAS{}@PAIR(3) $=0.02$); Llama-3.1-8B shows the reverse.
 Single-number \ASR{} cannot rank models when the ordering is a function of attacker capability.
 
-\paragraph{Finding 3: complementary search coverage.}
-Running judge-guided and \BCA{}-guided \textsc{TAP} in parallel raises union deploy coverage from ${\sim}57\%$ to ${\sim}78\%$ on pooled seeds (102 paired runs, $L{=}8$), with symmetric exclusive wins.
+\paragraph{Finding 3: complementary \textsc{TAP} coverage.}
+Running judge-guided and \BCA{}-guided \textsc{TAP} in parallel (BCA prunes, judge picks deploy) raises union deploy coverage from ${\sim}57\%$ to ${\sim}78\%$ on pooled seeds (102 paired runs, $L{=}8$), with symmetric exclusive wins.
 When both methods succeed, selected prompts are never identical---\BCA{} changes attack trajectories, not just rediscovers the same jailbreak.
+Pure \BCA{} deploy selection collapses to 24.1\% despite 58.3\% any-leaf success, separating search failure from selection failure.
 
 \paragraph{Finding 4 (conditional bonus): \BCA{} as pruning signal.}
 On a single-seed \textsc{TAP} run, hybrid pruning ($0.5\cdot$judge $+0.5\cdot$\BCA) raises judge-\ASR{} from 60.0\% to 73.3\%.
@@ -338,55 +339,122 @@ Llama-3.1-8B & 540 & 0.534 & 0.79 & 6.73$\times$ \\
 \end{tabular}
 \end{table}
 
-\subsection{\BCA{} inside adaptive red-teaming}
+\subsection{\BCA{} inside \textsc{TAP} adaptive red-teaming}
 \label{sec:tap}
 
-We integrate \BCA{} into PAIR and \textsc{TAP} on Llama-3.1-8B by swapping the per-candidate pruning score: \emph{regular} (judge), \emph{bca} (bounded mass), \emph{hybrid} ($0.5\cdot$judge $+0.5\cdot$\BCA).
-All cells are evaluated on held-out \textbf{judge-\ASR{}} (any leaf scoring 10/10), independent of the pruning objective.
-Inner tree: $\alpha{=}0.99$, $k{=}2$, $L{=}8$, exact \DTMC{}, Qwen judge unless noted.
+We integrate \BCA{} into \textsc{TAP}~\citep{mehrotra2024tap} on Llama-3.1-8B by swapping the per-candidate \emph{pruning} score while keeping the same attacker and inner tree ($\alpha{=}0.99$, $k{=}2$, $L{=}8$, exact \DTMC{}, Qwen judge unless noted).
+Three variants: \emph{regular} (judge score), \emph{bca} (bounded $\Prob[\mathbf{F}\,\harm]$), \emph{hybrid} ($0.5\cdot$judge $+0.5\cdot$\BCA).
+Unless stated otherwise, \textbf{deploy \ASR{}} means the leaf actually shipped---argmax \texttt{regular\_score} for regular/hybrid, argmax BCA mass for pure \BCA{}---and is evaluated independently of the pruning objective.
+We also report \emph{any-leaf \ASR{}}: whether \emph{any} tree leaf scored 10/10, i.e.\ what the search discovered.
+
+\paragraph{Pruning signal under \textsc{TAP}.}
+Table~\ref{tab:tap} compares pruning objectives at $q_{\max}$.
+\BCA{}'s dense $[0,1]$ scores help prune \textsc{TAP}'s wide candidate sets ($b{\cdot}w$ children per depth): any-leaf judge-\ASR{} rises from 60.0\% (judge) to 62.5\% (\BCA{}) on a single-seed run.
+Hybrid reaches 73.3\% on that seed but does not survive multi-seed replication ($\Delta{=}+4.5$ pp $\pm 13.6$ pp over four Qwen seeds; 95\% CI contains zero).
+For contrast, the same swap \emph{hurts} under PAIR's linear refinement (50.0\% $\to$ 40.0\%); we did not run parallel union-coverage experiments for PAIR.
+GCG has no natural \BCA{} variant and hit 0\% at 200 steps despite ${\sim}5000\times$ more target forwards per behavior than one \textsc{TAP} query.
 
 \begin{table}[t]
 \centering
 \small
-\caption{Pruning signal vs.\ independent judge-\ASR{} @ $q_{\max}$ (Llama target).}
+\caption{\textsc{TAP} pruning signal vs.\ any-leaf judge-\ASR{} @ $q_{\max}$ (Llama-3.1-8B target, single seed).}
 \label{tab:tap}
 \begin{tabular}{llrr}
 \toprule
-Attacker & Pruning & $q_{\max}$ & judge-\ASR{} \\
+Attacker & Pruning & $q_{\max}$ & Any-leaf \ASR{} \\
 \midrule
-PAIR & judge & 10 & 50.0\% \\
-PAIR & \BCA{} & 10 & 40.0\% \\
-PAIR & hybrid & 10 & 35.7\% \\
 \textsc{TAP} & judge & 12 & 60.0\% \\
 \textsc{TAP} & \BCA{} & 12 & 62.5\% \\
 \textsc{TAP} & hybrid & 12 & \textbf{73.3\%} \\
-GCG & xent & 200 steps & 0.0\% \\
+\midrule
+PAIR & judge & 10 & 50.0\% \\
+PAIR & \BCA{} & 10 & 40.0\% \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Under \textsc{TAP}, \BCA{}'s dense $[0,1]$ scores help prune wide candidate sets ($b{\cdot}w$ children per depth); under PAIR's linear refinement the binary judge wins (50.0\% vs.\ 40.0\%).
-GCG has no natural \BCA{} variant (non-differentiable through the bounded tree) and hit 0\% at 200 steps despite ${\sim}5000\times$ more target forwards per behavior than one \textsc{TAP} query.
+\paragraph{Search vs.\ selection (a distinct failure mode).}
+Pure \BCA{} pruning with \BCA{}-based deploy selection exposes a failure mode invisible to any-leaf \ASR{}: the tree may contain a jailbreak, but the mass-maximizing leaf is safe.
+Across seeds 42--45 (30 behaviors, $L{=}8$), any-leaf \ASR{} is 58.3\% (63/108) under \BCA{} pruning---comparable to regular (57.0\%, 61/107)---yet \textbf{deploy \ASR{} collapses to 24.1\%} (26/108) when \BCA{} also picks the deploy leaf (Table~\ref{tab:deploy}).
+The operational split---\textbf{\BCA{} prunes, judge picks deploy}---restores deploy \ASR{} to 58.3\% on the same trees.
+Density signals guide exploration; binary deployment judgments need outcome-aligned scores.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Any-leaf vs.\ deploy \ASR{} on \textsc{TAP} trees (seeds 42--45 pooled, $L{=}8$, 30 behaviors).}
+\label{tab:deploy}
+\begin{tabular}{lrr}
+\toprule
+Method & Any-leaf \ASR{} & Deploy \ASR{} \\
+\midrule
+Regular (judge prune + pick) & 57.0\% (61/107) & 57.0\% (61/107) \\
+\BCA{} (BCA prune + BCA pick) & 58.3\% (63/108) & \textbf{24.1\%} (26/108) \\
+\BCA{} prune + judge pick & 58.3\% (63/108) & 58.3\% (63/108) \\
+Hybrid (0.5$\cdot$judge + 0.5$\cdot$\BCA) & 61.5\% (67/109) & 61.5\% (67/109) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Complementary failure coverage.}
+The load-bearing \textsc{TAP} result is not a robust \ASR{} win per unit compute but \emph{coverage} when judge-guided and \BCA{}-guided searches run in parallel (BCA prune, judge pick for the BCA tree).
+On 102 paired (seed, behavior) runs where both trees completed, deploy success sets overlap but do not coincide (Table~\ref{tab:complementarity}).
+Either method alone deploys a jailbreak on ${\sim}57\%$ of pairs; the \textbf{union reaches 78.4\%} (80/102, +21 pp at 2$\times$ \textsc{TAP} cost).
+Exclusive wins are roughly symmetric (20 regular-only vs.\ 22 \BCA{}+judge-only) and spread across the same three HarmBench categories---\BCA{} does not specialize on a different \emph{class} of test case, but reaches a partially disjoint set of \emph{individual behaviors}.
+When both methods succeed on the same goal, winning prompts are \textbf{never identical} (0/38 pooled); framing often shifts (e.g.\ hypothetical vs.\ historical) even when both jailbreak.
+For adversarial training and audit campaigns whose goal is distinct failure modes rather than one cheap jailbreak, \BCA{}-guided \textsc{TAP} is best viewed as a complementary search prior, not a replacement for judge-based scoring.
+
+\begin{table}[t]
+\centering
+\small
+\caption{\textsc{TAP} deploy complementarity (102 paired runs, seeds 42--45, $L{=}8$; BCA tree uses judge pick).}
+\label{tab:complementarity}
+\begin{tabular}{lrr}
+\toprule
+Outcome & Count & Share \\
+\midrule
+Both regular and \BCA{}+judge deploy succeed & 38 & 37.3\% \\
+Regular-only (\BCA{}+judge misses) & 20 & 19.6\% \\
+\BCA{}+judge-only (regular misses) & 22 & 21.6\% \\
+Neither deploys & 22 & 21.6\% \\
+\midrule
+\textbf{Union (either deploys)} & \textbf{80} & \textbf{78.4\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{100-behavior scale ($L{=}12$, seed 44).}
+The 30-behavior runs above cover harassment, malware, and physical harm only.
+On the full 100-behavior JailbreakBench suite ($L{=}12$, $b{=}2,w{=}3,d{=}3$) we compare \emph{regular + rich \BCA{} attacker feedback} (BCA informs iterative feedback only; pruning and deploy remain judge-only) vs.\ \BCA{} prune + judge-pick deploy.
+Standalone deploy \ASR{} is 43.0\% (37/86 completed) vs.\ 36.9\% (31/84).
+On 80 paired behaviors, union deploy \ASR{} is \textbf{55.0\%} (44/80) vs.\ 43.0\% regular-only (Table~\ref{tab:complementarity100})---still complementary, but weaker than the 78.4\% union on the first three categories at $L{=}8$, as disinformation, fraud, and privacy dominate the long tail.
+
+\begin{table}[t]
+\centering
+\small
+\caption{100-behavior \textsc{TAP} complementarity (seed 44, $L{=}12$, 80 paired behaviors).}
+\label{tab:complementarity100}
+\begin{tabular}{lrr}
+\toprule
+Outcome & Count & Share \\
+\midrule
+Both deploy succeed & 19 & 23.8\% \\
+Regular+rich only & 15 & 18.8\% \\
+\BCA{}+judge-pick only & 10 & 12.5\% \\
+Neither deploys & 36 & 45.0\% \\
+\midrule
+\textbf{Union (either deploys)} & \textbf{44} & \textbf{55.0\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \paragraph{Multi-seed and multi-judge robustness.}
 The single-seed hybrid +13.3 pp gain does not survive replication.
 On 30 behaviors with Qwen in-loop: regular 66.7\%, hybrid 63.0\% ($\Delta{=}{-}3.7$ pp).
 With HarmBench in-loop: regular 58.3\%, hybrid 53.8\% ($\Delta{=}{-}4.5$ pp).
 Llama Guard~3 saturates at 100\% \ASR{} (75/75 trees) and is unsuitable for comparative pruning.
-Pooled over four Qwen-pruning seeds (42--45): regular 57.0\%, hybrid 61.5\%, $\Delta{=}+4.5$ pp $\pm 13.6$ pp (95\% CI contains zero).
-We therefore present hybrid pruning as exploratory, not load-bearing.
-
-\paragraph{Search vs.\ selection.}
-Pure \BCA{} pruning with \BCA{}-based deploy selection collapses deploy \ASR{} to 24.1\% despite 58.3\% \emph{any-leaf} success.
-The operational split---\textbf{\BCA{} prunes, judge picks}---restores deploy \ASR{} to 58.3\%.
-Density signals guide exploration; binary deployment judgments need outcome-aligned scores.
-
-\paragraph{Complementarity.}
-On 102 paired (seed, behavior) runs (seeds 42--45, $L{=}8$): union deploy coverage \textbf{78.4\%} vs.\ ${\sim}57\%$ for either method alone (both=37.3\%, regular-only=19.6\%, \BCA{}+judge-only=21.6\%, neither=21.6\%).
-When both succeed, winning prompts differ on all 38 pooled pairs.
-
-\paragraph{100-behavior scale ($L{=}12$, seed 44).}
-On the full JailbreakBench suite we compare \emph{regular + rich \BCA{} attacker feedback} (BCA informs iterative feedback only; pruning and deploy remain judge-only) vs.\ \BCA{} prune + judge-pick deploy: deploy \ASR{} 43.0\% (37/86) vs.\ 36.9\% (31/84); on 80 paired behaviors union deploy \ASR{} is \textbf{55.0\%} (44/80) vs.\ 43.0\% regular-only---harder categories (disinformation, fraud, privacy) dominate the long tail vs.\ the 78.4\% union on the first three categories at $L{=}8$.
+Pooled over four Qwen-pruning seeds (42--45): regular 57.0\%, hybrid 61.5\%.
+We therefore treat hybrid pruning as exploratory; the durable \textsc{TAP} claim is complementarity under parallel search, not a guaranteed \ASR{} lift from \BCA{} as pruning objective.
 
 \section{Discussion}
 \label{sec:discussion}
@@ -414,8 +482,8 @@ For red-teaming we find $L\in\{8,12\}$ sufficient to separate models and rank te
 
 Attack success rate asks whether a sample failed.
 Bounded continuation analysis asks how much harmful probability mass lives in the likely branches around a prompt---and, under \GAS{}, how that mass grows with attacker budget.
-Across JailbreakBench targets, this diagnostic separates models with identical greedy \ASR{}, predicts independent-judge attack success, and supports complementarity-based audit campaigns.
-The load-bearing claims are Pillars~1--2 (ranking flips and distributional fragility); \BCA{}-as-pruning gains are secondary and not yet robust across judges and seeds.
+Across JailbreakBench targets, this diagnostic separates models with identical greedy \ASR{}, predicts independent-judge attack success, and supports \textsc{TAP} complementarity campaigns that surface disjoint jailbreaks at 2$\times$ search cost.
+The load-bearing claims are Pillars~1--2 (ranking flips and distributional fragility) and \textsc{TAP} parallel-search coverage (Finding~3); hybrid \BCA{} pruning gains are secondary and not yet robust across judges and seeds.
 We argue this is a template for actionable interpretability in safety: expose conditional structure, then tie it to measurement protocols red teams can run today.
 
 \bibliography{refs}
@@ -431,38 +499,7 @@ Code and interactive complementarity visualizations accompany the project websit
 \section{Extended tables}
 \label{app:comp}
 
-\begin{table}[h]
-\centering
-\small
-\caption{Deploy vs.\ any-leaf \ASR{} (seeds 42--45 pooled, $L{=}8$).}
-\begin{tabular}{lrr}
-\toprule
-Method & Any-leaf \ASR{} & Deploy \ASR{} \\
-\midrule
-Regular (judge prune + pick) & 57.0\% & 57.0\% \\
-\BCA{} (BCA prune + pick) & 58.3\% & 24.1\% \\
-\BCA{} prune + judge pick & 58.3\% & 58.3\% \\
-Hybrid & 61.5\% & 61.5\% \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\begin{table}[h]
-\centering
-\small
-\caption{100-behavior complementarity (seed 44, $L{=}12$, 80 paired behaviors).}
-\begin{tabular}{lr}
-\toprule
-Outcome & Share \\
-\midrule
-Both deploy & 23.8\% \\
-Regular+rich only & 18.8\% \\
-BCA+judge-pick only & 12.5\% \\
-Neither & 45.0\% \\
-\textbf{Union} & \textbf{55.0\%} \\
-\bottomrule
-\end{tabular}
-\end{table}
+Appendix tables duplicate Table~\ref{tab:deploy}--\ref{tab:complementarity100} for offline reference and add cross-judge \textsc{TAP} comparisons.
 
 \begin{table}[h]
 \centering
